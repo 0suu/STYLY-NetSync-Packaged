@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NetSync Android Server</string>
+    <string name="notification_channel_description">Foreground service for STYLY NetSync server</string>
+    <string name="notification_channel_name">NetSync Server</string>
+    <string name="notification_title">Server running</string>
+    <string name="refresh_log">Refresh Log</string>
+    <string name="start">Start</string>
+    <string name="stop">Stop</string>
+    <style name="Theme.NetSyncAndroid" parent="Theme.AppCompat.DayNight.NoActionBar"/>
+</resources>
