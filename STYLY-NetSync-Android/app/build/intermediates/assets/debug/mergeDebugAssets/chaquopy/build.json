@@ -13,7 +13,7 @@
         "bootstrap-native/arm64-v8a/zlib.cpython-313-aarch64-linux-android.so": "8c562f03d43690e3cba72f75321aad4e3b2aa858",
         "bootstrap-native/arm64-v8a/_lzma.cpython-313-aarch64-linux-android.so": "e8b98edcbe491b8d83a5ef7a01fb986de3eb7c6b",
         "bootstrap-native/arm64-v8a/binascii.cpython-313-aarch64-linux-android.so": "17b1d62d74405dc7910883b1557004bd3e10b27e",
-        "app.imy": "cfff41270c10129c919fdfcb7262f5b616da7e81",
+        "app.imy": "596a0adfb4b7fa455d28f741adb2305415af1985",
         "bootstrap-native/arm64-v8a/mmap.cpython-313-aarch64-linux-android.so": "4bec75e128095f2d4fc896be30560f42560da443",
         "bootstrap-native/arm64-v8a/_ctypes.cpython-313-aarch64-linux-android.so": "2d78e8e693016c53280a45e9d88c17902ab88cf9",
         "stdlib-common.imy": "241988a283439f92ef2b0ec138f732ac0dc1f61e",

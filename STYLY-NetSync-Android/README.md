@@ -59,3 +59,4 @@
 ## Log checks
 - App UI log tail reads `filesDir/netsync.log`.
 - `adb logcat | grep NetSync` for Kotlin-side transitions.
+- Runtime status logs from Python server are also written to `filesDir/netsync.log` (e.g., periodic `Status: ...` lines).

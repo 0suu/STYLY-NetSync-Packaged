@@ -9,7 +9,7 @@ _stop = threading.Event()
 _started = threading.Event()
 _start_error: str | None = None
 _server = None
-BOOTSTRAP_REV = "2026-02-10b"
+BOOTSTRAP_REV = "2026-02-10d"
 
 
 def _append_log(log_path: str, message: str) -> None:

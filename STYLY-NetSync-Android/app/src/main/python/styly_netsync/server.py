@@ -142,11 +142,12 @@ class NetSyncServer:
     CLEANUP_INTERVAL = 1.0  # Cleanup every 1 second
     STATUS_LOG_INTERVAL = 10.0  # Log status every 10 seconds
     MAIN_LOOP_SLEEP = 0.02  # 50Hz main loop sleep
-    CLIENT_TIMEOUT = 1.0  # 1 second timeout for client disconnect
+    CLIENT_TIMEOUT: float | None = None  # Disabled on Android by default
     DEVICE_ID_EXPIRY_TIME = (
         300.0  # 5 minutes - remove device ID mappings after this time
     )
     POLL_TIMEOUT = 100  # ZMQ poll timeout in ms
+    NV_FLUSH_LOG_THRESHOLD_MS = 20.0  # Log only unusually slow NV flushes
 
     def __init__(
         self,
@@ -659,7 +660,7 @@ class NetSyncServer:
                             msg_type, data, raw_payload = binary_serializer.deserialize(
                                 message_bytes
                             )
-                            if msg_type == binary_serializer.MSG_CLIENT_TRANSFORM:
+                            if msg_type == binary_serializer.MSG_CLIENT_POSE_V2:
                                 self._handle_client_transform(
                                     client_identity, room_id, data, raw_payload
                                 )
@@ -1124,10 +1125,8 @@ class NetSyncServer:
             self._enqueue_pub(topic, msg)
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        if elapsed_ms > 10.0:
-            logger.info(f"NV flush took {elapsed_ms:.2f} ms (room={room_id})")
-        else:
-            logger.debug(f"NV flush took {elapsed_ms:.2f} ms (room={room_id})")
+        if elapsed_ms >= self.NV_FLUSH_LOG_THRESHOLD_MS:
+            logger.warning(f"NV flush took {elapsed_ms:.2f} ms (room={room_id})")
 
     def _broadcast_id_mappings(self, room_id: str):
         """Broadcast all device ID mappings for a room (including stealth clients with flag)"""
@@ -1149,7 +1148,10 @@ class NetSyncServer:
             if mappings:
                 # Serialize and broadcast the mappings
                 topic_bytes = room_id.encode("utf-8")
-                message_bytes = binary_serializer.serialize_device_id_mapping(mappings)
+                server_version = binary_serializer.parse_version(get_version())
+                message_bytes = binary_serializer.serialize_device_id_mapping(
+                    mappings, server_version
+                )
                 self._enqueue_pub(topic_bytes, message_bytes)
                 logger.info(
                     f"Broadcasted {len(mappings)} ID mappings to room {room_id}"
@@ -1289,6 +1291,8 @@ class NetSyncServer:
     def _cleanup_clients(self, current_time):
         """Clean up disconnected clients with atomic operations to prevent memory leaks"""
         timeout = self.CLIENT_TIMEOUT
+        if timeout is None or timeout <= 0:
+            return
 
         with self._rooms_lock:
             rooms_to_remove = []
@@ -1304,15 +1308,18 @@ class NetSyncServer:
                 # Remove timed out clients in batch
                 if clients_to_remove:
                     for device_id in clients_to_remove:
-                        client_no = clients[device_id].get("client_no")
+                        removed_client = clients[device_id]
+                        client_no = removed_client.get("client_no")
                         del clients[device_id]
                         # Clean up binary cache by client number
                         if client_no and client_no in self.client_binary_cache:
                             del self.client_binary_cache[client_no]
                         # Note: We don't remove device ID->clientNo mapping here
                         # It will be cleaned up after DEVICE_ID_EXPIRY_TIME
+                        elapsed = current_time - removed_client["last_update"]
                         logger.info(
-                            f"Client {device_id[:8]}... (client number: {client_no}) removed (timeout)"
+                            f"Client {device_id[:8]}... (client number: {client_no}) removed "
+                            f"(timeout, last_update={elapsed:.2f}s ago)"
                         )
 
                     # Mark room as dirty since clients were removed

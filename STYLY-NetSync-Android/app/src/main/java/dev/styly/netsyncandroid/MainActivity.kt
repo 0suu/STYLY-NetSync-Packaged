@@ -100,6 +100,7 @@ class MainActivity : ComponentActivity() {
                         logPath = File(filesDir, "netsync.log").absolutePath,
                         onStart = { host, port -> startServer(host, port) },
                         onStop = { stopServer() },
+                        onClearLog = { clearLogFile() },
                     )
                 }
             }
@@ -144,6 +145,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun clearLogFile() {
+        val file = File(filesDir, "netsync.log")
+        try {
+            if (file.exists()) {
+                file.writeText("")
+            }
+        } catch (e: Throwable) {
+            Log.e(NetSyncForegroundService.TAG, "Failed to clear log file: ${file.absolutePath}", e)
+        }
+    }
+
     private fun getLanIpAddress(context: Context): String {
         return try {
             val wifiManager = context.applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
@@ -164,6 +176,7 @@ private fun MainScreen(
     logPath: String,
     onStart: (String, Int) -> Unit,
     onStop: () -> Unit,
+    onClearLog: () -> Unit,
 ) {
     var host by remember { mutableStateOf(initialHost.ifBlank { "0.0.0.0" }) }
     var portText by remember { mutableStateOf(initialPort.toString()) }
@@ -224,19 +237,14 @@ private fun MainScreen(
                 Text(stringResource(R.string.stop))
             }
 
-            Button(onClick = { refreshTick += 1 }) {
+            Button(onClick = {
+                onClearLog()
+                logTail = ""
+                refreshTick += 1
+            }) {
                 Text(stringResource(R.string.refresh_log))
             }
         }
-
-        Text(
-            text = "注意: Foreground Service + WakeLockによりバックグラウンド継続性は上がりますが、機種や省電力設定で停止する場合があります。",
-            style = MaterialTheme.typography.bodySmall,
-        )
-        Text(
-            text = "UDPブロードキャスト探索は画面OFFや省電力で不安定になる場合があります。可能なら固定IPやQR配布のユニキャスト方式を推奨します。",
-            style = MaterialTheme.typography.bodySmall,
-        )
 
         Spacer(modifier = Modifier.height(8.dp))
         Text("Logs (tail)")

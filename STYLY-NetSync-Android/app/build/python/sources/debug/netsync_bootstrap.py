@@ -9,7 +9,7 @@ _stop = threading.Event()
 _started = threading.Event()
 _start_error: str | None = None
 _server = None
-BOOTSTRAP_REV = "2026-02-10a"
+BOOTSTRAP_REV = "2026-02-10d"
 
 
 def _append_log(log_path: str, message: str) -> None:
@@ -64,25 +64,30 @@ def _run_styly_server(host: str, port: int, log_path: str) -> None:
     log_dir = os.path.dirname(log_path)
     configure_logging(log_dir=log_dir, console_level="INFO", console_json=False)
 
-    _server = NetSyncServer(
+    local_server = NetSyncServer(
         dealer_port=port,
         pub_port=port + 1,
         enable_server_discovery=False,
     )
+    _server = local_server
 
     _append_log(
         log_path,
         f"[bootstrap] Starting STYLY server host={host} dealer={port} pub={port + 1}",
     )
-    _server.start()
+    local_server.start()
     _started.set()
 
     try:
         while not _stop.is_set():
             time.sleep(0.2)
     finally:
-        _server.stop()
-        _server = None
+        try:
+            local_server.stop()
+        except Exception as e:
+            _append_log(log_path, f"[bootstrap] server stop error: {type(e).__name__}: {e}")
+        if _server is local_server:
+            _server = None
         _append_log(log_path, "[bootstrap] STYLY server stopped")
 
 

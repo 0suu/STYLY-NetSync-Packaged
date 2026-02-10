@@ -17,7 +17,7 @@ from loguru._ctime_functions import get_ctime
 LOG_ROTATION_SIZE_BYTES = 10 * 1024 * 1024
 LOG_ROTATION_MAX_AGE = timedelta(days=7)
 LOG_RETENTION_MAX_FILES = 20
-DEFAULT_LOG_FILENAME = "netsync-server.log"
+DEFAULT_LOG_FILENAME = "netsync.log"
 RotationRule = str | int | float | timedelta | Callable[[Any, Any], bool]
 RetentionRule = str | int | float | timedelta | Callable[[list[Any]], Any]
 
@@ -210,10 +210,11 @@ def configure_logging(
             logger.add(
                 log_file,
                 level="DEBUG",
-                serialize=True,
+                serialize=False,
                 rotation=rotation_rule,
                 retention=retention_rule,
                 enqueue=enqueue_logs,
+                format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}",
                 backtrace=False,
                 diagnose=False,
             )
