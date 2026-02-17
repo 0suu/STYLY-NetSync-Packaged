@@ -19,6 +19,34 @@
 - Existing server is ZeroMQ-based. If `pyzmq` is unavailable or broken, startup fails fast and the service enters `ERROR`.
 - Service acquires `PARTIAL_WAKE_LOCK` and `WifiManager.MulticastLock` while running.
 
+## Upstream tracking workflow
+- Single upstream source of truth: `../STYLY-NetSync-Server/src/styly_netsync`
+- Android canonical mirror: `python-source/styly_netsync`
+- Generated module outputs:
+  - `app/src/main/python/styly_netsync`
+  - `netsync-aar/src/main/python/styly_netsync`
+- Android-specific diffs are managed as patch series:
+  - `python-overrides/patches/styly_netsync/series`
+  - `python-overrides/patches/styly_netsync/*.patch`
+
+Do not edit generated module outputs directly. Edit upstream code and/or Android patch files, then re-sync.
+
+### Sync commands
+1. Apply upstream + Android patches and regenerate all targets:
+   - `bash scripts/sync_styly_netsync_from_server.sh`
+2. Check-only mode for CI/local validation (no file writes):
+   - `bash scripts/sync_styly_netsync_from_server.sh --check`
+
+### Typical upstream follow procedure
+1. Pull latest `STYLY-NetSync-Server`.
+2. Run:
+   - `bash STYLY-NetSync-Android/scripts/sync_styly_netsync_from_server.sh`
+3. If patch apply fails, update the relevant patch file(s) in:
+   - `STYLY-NetSync-Android/python-overrides/patches/styly_netsync`
+4. Re-run sync until clean.
+5. Validate:
+   - `bash STYLY-NetSync-Android/scripts/sync_styly_netsync_from_server.sh --check`
+
 ## Build in Android Studio
 1. Open `STYLY-NetSync-Android` in Android Studio.
 2. Let Gradle sync and install requested SDK/NDK components.
@@ -26,11 +54,21 @@
 4. Press `Start` and confirm persistent notification appears.
 5. Press `Stop` and confirm notification disappears.
 
+## Build Unity integration AAR
+1. Build the library module:
+   - `./gradlew :netsync-aar:assembleRelease`
+2. AAR output:
+   - `netsync-aar/build/outputs/aar/netsync-aar-release.aar`
+3. Unity call entrypoints:
+   - Service bridge class: `dev.styly.netsyncandroid.aar.NetSyncAndroidBridge`
+   - `start(Context, host, port)` / `stop(Context)`
+
 ## Local wheels requirement (offline pip)
 - This app installs Python dependencies with:
   - `--no-index --find-links src/main/python/wheels --only-binary=:all:`
 - Create this directory before build:
-  - `app/src/main/python/wheels/`
+  - app module: `app/src/main/python/wheels/`
+  - AAR module: `netsync-aar/src/main/python/wheels/`
 - Required wheel:
   - `pyzmq==27.1.0` with tags including `cp313` and `android_24_arm64_v8a`
   - Example pattern: `pyzmq-27.1.0-*-cp313-*-android_24_arm64_v8a.whl`

@@ -13,12 +13,12 @@
         "bootstrap-native/arm64-v8a/zlib.cpython-313-aarch64-linux-android.so": "8c562f03d43690e3cba72f75321aad4e3b2aa858",
         "bootstrap-native/arm64-v8a/_lzma.cpython-313-aarch64-linux-android.so": "e8b98edcbe491b8d83a5ef7a01fb986de3eb7c6b",
         "bootstrap-native/arm64-v8a/binascii.cpython-313-aarch64-linux-android.so": "17b1d62d74405dc7910883b1557004bd3e10b27e",
-        "app.imy": "596a0adfb4b7fa455d28f741adb2305415af1985",
+        "app.imy": "7da82b48fd5e09dc3b623ac383b8ca9c0947c354",
         "bootstrap-native/arm64-v8a/mmap.cpython-313-aarch64-linux-android.so": "4bec75e128095f2d4fc896be30560f42560da443",
         "bootstrap-native/arm64-v8a/_ctypes.cpython-313-aarch64-linux-android.so": "2d78e8e693016c53280a45e9d88c17902ab88cf9",
         "stdlib-common.imy": "241988a283439f92ef2b0ec138f732ac0dc1f61e",
         "stdlib-arm64-v8a.imy": "6e8176e62a95654981b3b5b7a35c0e34a2bf24fb",
-        "requirements-common.imy": "c55dc8c02117fb78cc80423618b30524a13f230c"
+        "requirements-common.imy": "140c93a3f0747b2c17716bcdf5eb0ef513731c99"
     },
     "extract_packages": [],
     "python_version": "3.13"

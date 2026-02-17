@@ -24,16 +24,16 @@ import java.util.concurrent.Executors
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
-enum class ServerState {
-    STOPPED,
-    STARTING,
-    RUNNING,
-    STOPPING,
-    ERROR,
+private object ServerState {
+    const val STOPPED = 0
+    const val STARTING = 1
+    const val RUNNING = 2
+    const val STOPPING = 3
+    const val ERROR = 4
 }
 
 data class ServiceStatus(
-    val state: ServerState = ServerState.STOPPED,
+    val state: Int = ServerState.STOPPED,
     val host: String = "0.0.0.0",
     val port: Int = 5555,
     val message: String = "",

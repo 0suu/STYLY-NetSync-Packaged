@@ -50,6 +50,15 @@ tasks.register("validatePythonWheels") {
     }
 }
 
+val syncScriptRelativePath = "scripts/sync_styly_netsync_from_server.sh"
+
+tasks.register<Exec>("syncPythonSources") {
+    group = "build setup"
+    description = "Sync styly_netsync from Server upstream and Android patches."
+    workingDir = rootProject.projectDir
+    commandLine("bash", syncScriptRelativePath)
+}
+
 android {
     namespace = "dev.styly.netsyncandroid"
     compileSdk = 35
@@ -131,5 +140,5 @@ dependencies {
 }
 
 tasks.named("preBuild") {
-    dependsOn("validatePythonWheels")
+    dependsOn("syncPythonSources", "validatePythonWheels")
 }

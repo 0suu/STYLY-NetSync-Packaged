@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "STYLY-NetSync-Android"
 include(":app")
+include(":netsync-aar")

@@ -1,0 +1,22 @@
+diff --git a/styly_netsync/__init__.py b/styly_netsync/__init__.py
+index 86d51c8..016ad46 100755
+--- a/styly_netsync/__init__.py
++++ b/styly_netsync/__init__.py
+@@ -26,10 +26,16 @@ Examples:
+     snapshot = manager.get_room_transform_data()
+ """
+ 
+-from .client import net_sync_manager
+ from .server import NetSyncServer, get_version
+ from .types import client_transform_data, room_transform_data, transform_data
+ 
++try:
++    from .client import net_sync_manager
++except Exception:
++    # On Android/Chaquopy, pyzmq may be unavailable or partially installed.
++    # Keep server-side imports usable, and fail only when client API is requested.
++    net_sync_manager = None
++
+ # Export public API
+ __all__ = [
+     # Server API

@@ -1,0 +1,1081 @@
+diff --git a/styly_netsync/client_simulator.py b/styly_netsync/client_simulator.py
+index 133ca12..55dfeba 100755
+--- a/styly_netsync/client_simulator.py
++++ b/styly_netsync/client_simulator.py
+@@ -15,12 +15,9 @@ Architecture:
+ """
+ 
+ import argparse
+-import atexit
+ import logging
+ import math
+-import os
+ import random
+-import subprocess
+ 
+ # The 'resource' module is POSIX-only (Linux/macOS). On Windows it is unavailable.
+ # We make it optional and skip FD-limit checks when it's not present.
+@@ -33,10 +30,8 @@ import signal
+ import sys
+ import threading
+ import time
+-import types
+ import uuid
+ from abc import ABC, abstractmethod
+-from collections.abc import Callable
+ from dataclasses import dataclass, field
+ from enum import Enum
+ from typing import Any, Optional
+@@ -45,45 +40,22 @@ import zmq
+ 
+ # Import public APIs from styly_netsync module
+ from styly_netsync.binary_serializer import (
+-    MSG_CLIENT_POSE,
++    MSG_CLIENT_TRANSFORM,
+     MSG_CLIENT_VAR_SET,
+     MSG_CLIENT_VAR_SYNC,
+     MSG_DEVICE_ID_MAPPING,
+     MSG_GLOBAL_VAR_SET,
+     MSG_GLOBAL_VAR_SYNC,
+-    MSG_ROOM_POSE,
++    MSG_ROOM_TRANSFORM,
+     MSG_RPC,
+     deserialize,
+     serialize_client_transform,
+     serialize_client_var_set,
+ )
+ 
+-
+-def euler_to_quaternion(
+-    x_rad: float, y_rad: float, z_rad: float
+-) -> tuple[float, float, float, float]:
+-    """Convert Euler angles (radians) to a quaternion (x, y, z, w)."""
+-    x = x_rad
+-    y = y_rad
+-    z = z_rad
+-
+-    cx = math.cos(x * 0.5)
+-    sx = math.sin(x * 0.5)
+-    cy = math.cos(y * 0.5)
+-    sy = math.sin(y * 0.5)
+-    cz = math.cos(z * 0.5)
+-    sz = math.sin(z * 0.5)
+-
+-    qw = cx * cy * cz + sx * sy * sz
+-    qx = sx * cy * cz - cx * sy * sz
+-    qy = cx * sy * cz + sx * cy * sz
+-    qz = cx * cy * sz - sx * sy * cz
+-    return qx, qy, qz, qw
+-
+-
+ MESSAGE_TYPE_NAMES: dict[int, str] = {
+-    MSG_CLIENT_POSE: "CLIENT_POSE",
+-    MSG_ROOM_POSE: "ROOM_POSE",
++    MSG_CLIENT_TRANSFORM: "CLIENT_TRANSFORM",
++    MSG_ROOM_TRANSFORM: "ROOM_TRANSFORM",
+     MSG_RPC: "RPC",
+     MSG_DEVICE_ID_MAPPING: "DEVICE_ID_MAPPING",
+     MSG_GLOBAL_VAR_SET: "GLOBAL_VAR_SET",
+@@ -129,7 +101,7 @@ class Vector3:
+ 
+ @dataclass
+ class Transform:
+-    """6DOF transform with position and rotation (Euler -> quaternion on wire)."""
++    """6DOF transform with position and rotation."""
+ 
+     position: Vector3 = field(default_factory=Vector3)
+     rotation: Vector3 = field(default_factory=Vector3)
+@@ -137,17 +109,13 @@ class Transform:
+ 
+     def to_dict(self) -> dict[str, Any]:
+         """Convert to dictionary format expected by serializer."""
+-        qx, qy, qz, qw = euler_to_quaternion(
+-            self.rotation.x, self.rotation.y, self.rotation.z
+-        )
+         return {
+             "posX": self.position.x,
+             "posY": self.position.y,
+             "posZ": self.position.z,
+-            "rotX": qx,
+-            "rotY": qy,
+-            "rotZ": qz,
+-            "rotW": qw,
++            "rotX": self.rotation.x,
++            "rotY": self.rotation.y,
++            "rotZ": self.rotation.z,
+             "isLocalSpace": self.is_local_space,
+         }
+ 
+@@ -319,7 +287,7 @@ class SpiralMovement(MovementStrategy):
+ class MovementStrategyFactory:
+     """Factory for creating movement strategies."""
+ 
+-    _strategies: dict[MovementPattern, type[MovementStrategy]] = {
++    _strategies = {
+         MovementPattern.CIRCLE: CircleMovement,
+         MovementPattern.FIGURE8: Figure8Movement,
+         MovementPattern.RANDOM_WALK: RandomWalkMovement,
+@@ -388,33 +356,45 @@ class TransformBuilder:
+ 
+         return {
+             "deviceId": self.config.device_id,
+-            "poseSeq": 0,
+-            "flags": 0x3E,
+-            "physical": self._pose_dict(position, Vector3(0, self.rotation_y, 0), True),
+-            "head": self._pose_dict(
+-                head_position, Vector3(0, self.rotation_y, 0), False
+-            ),
+-            "rightHand": self._pose_dict(right_hand, Vector3(0, 0, 0), False),
+-            "leftHand": self._pose_dict(left_hand, Vector3(0, 0, 0), False),
++            "physical": {
++                "posX": position.x,
++                "posY": 0,  # Physical Y is always 0
++                "posZ": position.z,
++                "rotX": 0,
++                "rotY": self.rotation_y,
++                "rotZ": 0,
++                "isLocalSpace": True,
++            },
++            "head": {
++                "posX": head_position.x,
++                "posY": head_position.y,
++                "posZ": head_position.z,
++                "rotX": 0,
++                "rotY": self.rotation_y,
++                "rotZ": 0,
++                "isLocalSpace": False,
++            },
++            "rightHand": {
++                "posX": right_hand.x,
++                "posY": right_hand.y,
++                "posZ": right_hand.z,
++                "rotX": 0,
++                "rotY": 0,
++                "rotZ": 0,
++                "isLocalSpace": False,
++            },
++            "leftHand": {
++                "posX": left_hand.x,
++                "posY": left_hand.y,
++                "posZ": left_hand.z,
++                "rotX": 0,
++                "rotY": 0,
++                "rotZ": 0,
++                "isLocalSpace": False,
++            },
+             "virtuals": virtuals,
+         }
+ 
+-    @staticmethod
+-    def _pose_dict(
+-        position: Vector3, rotation: Vector3, is_local_space: bool
+-    ) -> dict[str, Any]:
+-        qx, qy, qz, qw = euler_to_quaternion(rotation.x, rotation.y, rotation.z)
+-        return {
+-            "posX": position.x,
+-            "posY": position.y,
+-            "posZ": position.z,
+-            "rotX": qx,
+-            "rotY": qy,
+-            "rotZ": qz,
+-            "rotW": qw,
+-            "isLocalSpace": is_local_space,
+-        }
+-
+     def _smooth_rotation(
+         self, current: float, target: float, delta_time: float
+     ) -> float:
+@@ -483,15 +463,15 @@ class TransformBuilder:
+             orbit_z = math.sin(phase) * radius * 0.7
+ 
+             virtuals.append(
+-                self._pose_dict(
+-                    Vector3(
+-                        avatar_center.x + orbit_x,
+-                        avatar_center.y + orbit_y,
+-                        avatar_center.z + orbit_z,
+-                    ),
+-                    Vector3(0, phase, 0),
+-                    False,
+-                )
++                {
++                    "posX": avatar_center.x + orbit_x,
++                    "posY": avatar_center.y + orbit_y,
++                    "posZ": avatar_center.z + orbit_z,
++                    "rotX": 0,
++                    "rotY": phase,
++                    "rotZ": 0,
++                    "isLocalSpace": False,
++                }
+             )
+ 
+         return virtuals
+@@ -513,8 +493,6 @@ class NetworkTransport:
+         sub_port: int,
+         room_id: str,
+         enable_sub: bool = True,
+-        socket_register: Callable[[zmq.Socket], None] | None = None,
+-        socket_unregister: Callable[[zmq.Socket], None] | None = None,
+     ):
+         self.context = context
+         self.server_addr = server_addr
+@@ -523,53 +501,27 @@ class NetworkTransport:
+         self.room_id = room_id
+         self.enable_sub = enable_sub
+         self.socket: zmq.Socket | None = None
+-        self.sub_socket: zmq.Socket[Any] | None = None
++        self.sub_socket: zmq.Socket | None = None
+         self.logger = logging.getLogger(self.__class__.__name__)
+-        self._socket_register = socket_register
+-        self._socket_unregister = socket_unregister
+-
+-    def _register_socket(self, socket: zmq.Socket[Any]) -> None:
+-        if self._socket_register:
+-            try:
+-                self._socket_register(socket)
+-            except Exception:
+-                pass
+-
+-    def _unregister_socket(self, socket: zmq.Socket[Any]) -> None:
+-        if self._socket_unregister:
+-            try:
+-                self._socket_unregister(socket)
+-            except Exception:
+-                pass
+ 
+     def connect(self) -> bool:
+         """Establish connection to server (both DEALER and SUB)."""
+         try:
+-            # DEALER for sending and control message receive
+-            # Low HWM (10) for backpressure detection matching Unity client
++            # DEALER for sending
+             self.socket = self.context.socket(zmq.DEALER)
+-            self._register_socket(self.socket)
+             self.socket.setsockopt(zmq.LINGER, 0)
+-            self.socket.setsockopt(zmq.IMMEDIATE, 1)
+-            self.socket.setsockopt(zmq.RCVTIMEO, 0)  # Non-blocking receive
+-            self.socket.setsockopt(zmq.SNDTIMEO, 1000)
+-            self.socket.setsockopt(zmq.SNDHWM, 10)  # Low HWM for backpressure
++            self.socket.setsockopt(zmq.RCVTIMEO, 1000)
+ 
+             dealer_endpoint = f"{self.server_addr}:{self.dealer_port}"
+             self.socket.connect(dealer_endpoint)
+             self.logger.debug(f"Connected DEALER to {dealer_endpoint}")
+ 
+             # Optional SUB for receiving broadcasts (ID mappings, NV syncs, etc.)
+-            # Low RCVHWM (2) to prefer recent updates and drop stale messages
+             if self.enable_sub:
+                 try:
+                     self.sub_socket = self.context.socket(zmq.SUB)
+-                    self._register_socket(self.sub_socket)
+                     self.sub_socket.setsockopt(zmq.LINGER, 0)
+                     self.sub_socket.setsockopt(zmq.RCVTIMEO, 10)  # non-blocking-ish
+-                    self.sub_socket.setsockopt(
+-                        zmq.RCVHWM, 2
+-                    )  # Low HWM to prefer recent
+                     sub_endpoint = f"{self.server_addr}:{self.sub_port}"
+                     self.sub_socket.connect(sub_endpoint)
+                     # Subscribe to room topic
+@@ -584,7 +536,6 @@ class NetworkTransport:
+                     try:
+                         if self.sub_socket:
+                             self.sub_socket.close()
+-                            self._unregister_socket(self.sub_socket)
+                     except Exception:
+                         pass
+                     finally:
+@@ -612,13 +563,9 @@ class NetworkTransport:
+                 [
+                     room_id.encode("utf-8"),
+                     binary_data,
+-                ],
+-                flags=zmq.NOBLOCK,
++                ]
+             )
+             return True
+-        except zmq.Again:
+-            # Drop when socket is not ready to avoid blocking under congestion.
+-            return False
+         except Exception as e:
+             self.logger.error(f"Failed to send transform: {e}")
+             return False
+@@ -643,13 +590,9 @@ class NetworkTransport:
+                 [
+                     room_id.encode("utf-8"),
+                     binary_data,
+-                ],
+-                flags=zmq.NOBLOCK,
++                ]
+             )
+             return True
+-        except zmq.Again:
+-            # Drop when socket is not ready to avoid blocking under congestion.
+-            return False
+         except Exception as e:
+             self.logger.error(f"Failed to send client variable: {e}")
+             return False
+@@ -713,79 +656,13 @@ class NetworkTransport:
+             # For other message types, drop and continue scanning
+         return None
+ 
+-    def recv_dealer_control(
+-        self, max_drain: int = 10
+-    ) -> tuple[int, dict[str, Any] | None] | None:
+-        """Receive control messages from DEALER socket (sent via ROUTER unicast).
+-
+-        Server sends RPC, NV sync, and ID mappings via ROUTER->DEALER for reliable
+-        delivery instead of PUB/SUB. This method drains incoming control messages.
+-
+-        Args:
+-            max_drain: Maximum number of messages to drain per call.
+-
+-        Returns:
+-            Tuple of (message_type, data) for the first relevant message, or None.
+-            Returns immediately on first valid message or after draining max_drain
+-            messages without finding a valid one.
+-        """
+-        if not self.socket:
+-            return None
+-
+-        for _ in range(max_drain):
+-            try:
+-                parts = self.socket.recv_multipart(flags=zmq.NOBLOCK)
+-            except zmq.Again:
+-                # No more messages available
+-                return None
+-            except zmq.ZMQError as e:
+-                # Terminal errors: stop draining
+-                if e.errno in (zmq.ETERM, zmq.ENOTSOCK):
+-                    self.logger.debug(f"DEALER socket error: {e}")
+-                    return None
+-                self.logger.debug(f"Non-fatal DEALER receive error: {e}")
+-                continue
+-            except Exception as e:
+-                self.logger.debug(f"DEALER receive error: {e}")
+-                # Continue to next iteration rather than returning early
+-                continue
+-
+-            if len(parts) != 2:
+-                continue
+-
+-            dealer_room_id, payload = parts
+-            room_id_str = dealer_room_id.decode("utf-8", errors="ignore")
+-
+-            # Only process messages for our room
+-            if room_id_str != self.room_id:
+-                continue
+-
+-            try:
+-                if not payload:
+-                    continue
+-                msg_type = payload[0]
+-                _, data, _ = deserialize(payload)
+-                return msg_type, data
+-            except Exception:
+-                # Malformed payload; skip and continue draining
+-                continue
+-
+-        # Drained max_drain messages without finding a valid one
+-        return None
+-
+-    def disconnect(self) -> None:
++    def disconnect(self):
+         """Close connection to server."""
+         if self.socket:
+-            try:
+-                self.socket.close()
+-            finally:
+-                self._unregister_socket(self.socket)
++            self.socket.close()
+             self.socket = None
+         if self.sub_socket:
+-            try:
+-                self.sub_socket.close()
+-            finally:
+-                self._unregister_socket(self.sub_socket)
++            self.sub_socket.close()
+             self.sub_socket = None
+ 
+ 
+@@ -795,64 +672,25 @@ class NetworkTransport:
+ 
+ 
+ class SharedSubscriber:
+-    """Single SUB socket that receives broadcasts and shares mappings.
+-
+-    IMPORTANT: As of PR #316, the intended primary path for ID mappings is
+-    ROUTER/DEALER unicast instead of PUB/SUB. Each SimulatedClient must poll
+-    its DEALER socket for control messages (including ID mappings) via
+-    _poll_dealer_control().
+-
+-    However, for backwards compatibility with older servers and mixed
+-    deployments, ID mapping messages (MSG_DEVICE_ID_MAPPING) may still be
+-    delivered via PUB/SUB, and this simulator continues to support mappings
+-    received on the shared SUB socket. In practice, ID mappings can therefore
+-    arrive via DEALER, SUB, or both, depending on server behavior.
+-
+-    SharedSubscriber is kept for backward compatibility and may still receive
+-    transform broadcasts via SUB; new features should prefer the DEALER-based
+-    control/mapping channel.
+-    """
++    """Single SUB socket that receives broadcasts and shares mappings."""
+ 
+     def __init__(
+-        self,
+-        context: zmq.Context[Any],
+-        server_addr: str,
+-        sub_port: int,
+-        room_id: str,
+-        socket_register: Callable[[zmq.Socket[Any]], None] | None = None,
+-        socket_unregister: Callable[[zmq.Socket[Any]], None] | None = None,
++        self, context: zmq.Context, server_addr: str, sub_port: int, room_id: str
+     ):
+         self.context = context
+         self.server_addr = server_addr
+         self.sub_port = sub_port
+         self.room_id = room_id
+         self.logger = logging.getLogger(self.__class__.__name__)
+-        self.socket: zmq.Socket[Any] | None = None
++        self.socket: zmq.Socket | None = None
+         self._thread: threading.Thread | None = None
+         self._running = False
+         self._lock = threading.Lock()
+         self._device_to_client: dict[str, int] = {}
+-        self._socket_register = socket_register
+-        self._socket_unregister = socket_unregister
+-
+-    def _register_socket(self, socket: zmq.Socket[Any]) -> None:
+-        if self._socket_register:
+-            try:
+-                self._socket_register(socket)
+-            except Exception:
+-                pass
+-
+-    def _unregister_socket(self, socket: zmq.Socket[Any]) -> None:
+-        if self._socket_unregister:
+-            try:
+-                self._socket_unregister(socket)
+-            except Exception:
+-                pass
+ 
+     def start(self) -> bool:
+         try:
+             self.socket = self.context.socket(zmq.SUB)
+-            self._register_socket(self.socket)
+             self.socket.setsockopt(zmq.LINGER, 0)
+             self.socket.setsockopt(zmq.RCVTIMEO, 10)
+             endpoint = f"{self.server_addr}:{self.sub_port}"
+@@ -872,7 +710,6 @@ class SharedSubscriber:
+             if self.socket is not None:
+                 try:
+                     self.socket.close()
+-                    self._unregister_socket(self.socket)
+                 except Exception:
+                     pass
+                 finally:
+@@ -880,7 +717,7 @@ class SharedSubscriber:
+             self.logger.error(f"Failed to start SharedSubscriber: {e}")
+             return False
+ 
+-    def stop(self) -> None:
++    def stop(self):
+         self._running = False
+         if self._thread and self._thread.is_alive():
+             try:
+@@ -892,8 +729,6 @@ class SharedSubscriber:
+                 self.socket.close()
+             except Exception:
+                 pass
+-            finally:
+-                self._unregister_socket(self.socket)
+             self.socket = None
+ 
+     def is_running(self) -> bool:
+@@ -903,11 +738,9 @@ class SharedSubscriber:
+         with self._lock:
+             return self._device_to_client.get(device_id, 0)
+ 
+-    def _loop(self) -> None:
++    def _loop(self):
+         # Drain many messages each tick to avoid backlog
+         while self._running:
+-            if self.socket is None:
+-                break
+             drained_any = False
+             for _ in range(200):  # aggressive drain
+                 try:
+@@ -959,9 +792,9 @@ class SimulatedClient:
+     """Represents a single simulated client."""
+ 
+     # Battery simulation constants
+-    BATTERY_INITIAL_MIN = 0.5  # Normalized (0.0-1.0)
+-    BATTERY_INITIAL_MAX = 1.0  # Normalized (0.0-1.0)
+-    BATTERY_DRAIN_RATE = 0.5 / 1200.0  # Normalized units lost per second (50% in 20 mins)
++    BATTERY_INITIAL_MIN = 50.0  # %
++    BATTERY_INITIAL_MAX = 100.0  # %
++    BATTERY_DRAIN_RATE = 10.0 / 60.0  # %-points lost per second (10%/min)
+     BATTERY_UPDATE_INTERVAL = 60.0  # Send battery updates every 60 seconds
+ 
+     def __init__(
+@@ -971,8 +804,7 @@ class SimulatedClient:
+         room_id: str,
+         shared_subscriber: Optional["SharedSubscriber"] = None,
+         simulate_battery: bool = True,
+-        enable_receive: bool = True,
+-        transform_send_rate: float = 10.0,
++        enable_receive: bool = False,
+     ):
+         self.config = config
+         self.transport = transport
+@@ -983,7 +815,6 @@ class SimulatedClient:
+         self.shared_subscriber = shared_subscriber
+         self.simulate_battery = simulate_battery
+         self.enable_receive = enable_receive
+-        self.transform_send_rate = transform_send_rate
+         self.recv_stats: ReceiveStats | None = (
+             ReceiveStats() if enable_receive else None
+         )
+@@ -1004,7 +835,7 @@ class SimulatedClient:
+             self.client_number = 0
+ 
+             self.logger.info(
+-                f"Initialized with battery level: {self.battery_level:.2f} (normalized), awaiting client number assignment"
++                f"Initialized with battery level: {self.battery_level:.1f}%, awaiting client number assignment"
+             )
+         else:
+             self.battery_level = 0.0
+@@ -1013,14 +844,14 @@ class SimulatedClient:
+             self.client_number = 0
+             self.logger.info("Battery simulation disabled")
+ 
+-    def run(self, stop_event: threading.Event) -> None:
++    def run(self, stop_event: threading.Event):
+         """Run the client simulation loop."""
+         if not self.transport.connect():
+             self.logger.error("Failed to connect to server")
+             return
+ 
+         self.running = True
+-        update_interval = 1.0 / self.transform_send_rate  # Calculate interval from rate
++        update_interval = 0.1  # 10Hz
+         last_send_time = time.monotonic()
+ 
+         try:
+@@ -1076,7 +907,7 @@ class SimulatedClient:
+             self.transport.disconnect()
+             if self.simulate_battery:
+                 self.logger.info(
+-                    f"Client stopped with final battery level: {self.battery_level:.2f} (normalized)"
++                    f"Client stopped with final battery level: {self.battery_level:.1f}%"
+                 )
+             else:
+                 self.logger.info("Client stopped")
+@@ -1094,7 +925,7 @@ class SimulatedClient:
+                 else:
+                     self.logger.info("No broadcasts received")
+ 
+-    def _update_battery(self, current_time: float) -> None:
++    def _update_battery(self, current_time: float):
+         """Update battery level and send updates when needed."""
+         # Update battery drain
+         elapsed_since_battery_update = current_time - self.last_battery_update
+@@ -1112,17 +943,17 @@ class SimulatedClient:
+             elapsed_since_send >= self.BATTERY_UPDATE_INTERVAL
+             and self.client_number > 0
+         ):
+-            battery_value = f"{self.battery_level:.2f}"
++            battery_value = f"{self.battery_level:.1f}"
+             if self.transport.send_client_variable(
+                 self.room_id, self.client_number, "BatteryLevel", battery_value
+             ):
+-                self.logger.debug(f"Sent battery level: {battery_value} (normalized)")
++                self.logger.debug(f"Sent battery level: {battery_value}%")
+             else:
+                 self.logger.warning("Failed to send battery level update")
+             self.last_battery_send = current_time
+ 
+-    def _poll_broadcasts(self) -> None:
+-        """Update local client number from shared subscriber, DEALER, or fallback SUB."""
++    def _poll_broadcasts(self):
++        """Update local client number from shared subscriber or fallback SUB."""
+         # Prefer shared subscriber for scalability
+         if self.shared_subscriber:
+             assigned = self.shared_subscriber.get_client_no(self.config.device_id)
+@@ -1131,11 +962,9 @@ class SimulatedClient:
+                 self.logger.info(
+                     f"Assigned client number by server: {self.client_number}"
+                 )
+-            # Still check DEALER for control messages even when using shared subscriber
+-            self._poll_dealer_control()
+             return
+ 
+-        # Fallback: use own transport SUB and DEALER if available
++        # Fallback: use own transport SUB if available
+         if not self.transport:
+             return
+ 
+@@ -1149,25 +978,6 @@ class SimulatedClient:
+         budget_ns = 5_000_000 if self.client_number == 0 else 1_000_000  # 5ms / 1ms
+         t0 = time.perf_counter_ns()
+ 
+-        # First, poll DEALER for control messages (RPC, NV, ID mapping via ROUTER unicast)
+-        while drained < max_drains and (time.perf_counter_ns() - t0) < budget_ns:
+-            msg = self.transport.recv_dealer_control(max_drain=1)
+-            if not msg:
+-                break
+-
+-            drained += 1
+-            msg_type, data = msg
+-            assigned_this_poll = self._process_mapping_message(
+-                msg_type, data, assigned_this_poll
+-            )
+-
+-            if self.enable_receive:
+-                self._handle_broadcast_payload(msg_type, data)
+-
+-            if assigned_this_poll and not self.enable_receive:
+-                break
+-
+-        # Then poll SUB for transform broadcasts
+         while drained < max_drains and (time.perf_counter_ns() - t0) < budget_ns:
+             msg = self.transport.recv_broadcast(allow_any=self.enable_receive)
+             if not msg:
+@@ -1175,64 +985,39 @@ class SimulatedClient:
+ 
+             drained += 1
+             msg_type, data = msg
+-            assigned_this_poll = self._process_mapping_message(
+-                msg_type, data, assigned_this_poll
+-            )
++
++            if msg_type == MSG_DEVICE_ID_MAPPING:
++                try:
++                    mappings = data.get("mappings", []) if data else []
++                    for mapping in mappings:
++                        if mapping.get("deviceId") == self.config.device_id:
++                            assigned = int(mapping.get("clientNo", 0))
++                            if assigned and assigned != self.client_number:
++                                self.client_number = assigned
++                                assigned_this_poll = True
++                                self.logger.info(
++                                    f"Assigned client number by server: {self.client_number}"
++                                )
++                            break
++                except Exception as exc:
++                    self.logger.debug(f"Failed to process broadcast: {exc}")
++
++                if self.enable_receive:
++                    self._handle_broadcast_payload(msg_type, data)
++
++                # Once assignment is confirmed we can stop early if we're not
++                # actively measuring receive throughput.
++                if assigned_this_poll and not self.enable_receive:
++                    break
++                continue
+ 
+             if self.enable_receive:
+                 self._handle_broadcast_payload(msg_type, data)
+ 
+-            # Once assignment is confirmed we can stop early if we're not
+-            # actively measuring receive throughput.
+-            if assigned_this_poll and not self.enable_receive:
+-                break
+-
+         # NOTE: Time budget may interrupt draining, but subsequent ticks will continue
+         # processing messages. This prevents send loop starvation.
+ 
+-    def _poll_dealer_control(self) -> None:
+-        """Poll DEALER socket for control messages when using shared subscriber."""
+-        if not self.transport:
+-            return
+-
+-        for _ in range(10):  # Drain up to 10 control messages
+-            msg = self.transport.recv_dealer_control(max_drain=1)
+-            if not msg:
+-                break
+-
+-            msg_type, data = msg
+-            self._process_mapping_message(msg_type, data, False)
+-
+-            if self.enable_receive:
+-                self._handle_broadcast_payload(msg_type, data)
+-
+-    def _process_mapping_message(
+-        self, msg_type: int, data: dict[str, Any] | None, already_assigned: bool
+-    ) -> bool:
+-        """Process device ID mapping message and return True if assignment occurred."""
+-        if msg_type != MSG_DEVICE_ID_MAPPING:
+-            return already_assigned
+-
+-        try:
+-            mappings = data.get("mappings", []) if data else []
+-            for mapping in mappings:
+-                if mapping.get("deviceId") == self.config.device_id:
+-                    assigned = int(mapping.get("clientNo", 0))
+-                    if assigned and assigned != self.client_number:
+-                        self.client_number = assigned
+-                        self.logger.info(
+-                            f"Assigned client number by server: {self.client_number}"
+-                        )
+-                        return True
+-                    break
+-        except Exception as exc:
+-            self.logger.debug(f"Failed to process mapping: {exc}")
+-
+-        return already_assigned
+-
+-    def _handle_broadcast_payload(
+-        self, msg_type: int, data: dict[str, Any] | None
+-    ) -> None:
++    def _handle_broadcast_payload(self, msg_type: int, data: dict[str, Any] | None):
+         """Record broadcast metadata for receive-mode load tests."""
+         if not self.recv_stats:
+             return
+@@ -1247,9 +1032,9 @@ class SimulatedClient:
+         if self.logger.isEnabledFor(logging.DEBUG):
+             message_name = MESSAGE_TYPE_NAMES.get(msg_type, f"UNKNOWN_{msg_type}")
+             summary = "payload"
+-            if msg_type == MSG_CLIENT_POSE and data:
++            if msg_type == MSG_CLIENT_TRANSFORM and data:
+                 summary = f"transform from {data.get('deviceId', 'unknown')}"
+-            elif msg_type == MSG_ROOM_POSE and data:
++            elif msg_type == MSG_ROOM_TRANSFORM and data:
+                 summary = f"room transform with {len(data.get('clients', []))} clients"
+             elif msg_type in (MSG_GLOBAL_VAR_SET, MSG_CLIENT_VAR_SET) and data:
+                 summary = (
+@@ -1284,7 +1069,7 @@ class ClientThreadPool:
+             return False
+ 
+         thread = threading.Thread(
+-            target=client.run, args=(self.stop_event,), daemon=False
++            target=client.run, args=(self.stop_event,), daemon=True
+         )
+ 
+         try:
+@@ -1296,7 +1081,7 @@ class ClientThreadPool:
+             self.logger.error(f"Failed to start client thread: {e}")
+             return False
+ 
+-    def stop_all(self, timeout: float = 2.0) -> None:
++    def stop_all(self, timeout: float = 2.0):
+         """Stop all client threads."""
+         self.logger.info("Stopping all client threads...")
+         self.stop_event.set()
+@@ -1420,65 +1205,6 @@ class ResourceManager:
+         except Exception as e:
+             return False, f"Failed to raise FD limit: {e}"
+ 
+-    @staticmethod
+-    def bump_fd_soft_limit(target: int, logger: logging.Logger) -> None:
+-        """Best-effort bump of RLIMIT_NOFILE to target within hard limit."""
+-        if not ResourceManager._has_resource():
+-            logger.info(
+-                "Skipping FD soft limit bump: 'resource' module not available on this platform."
+-            )
+-            return
+-
+-        try:
+-            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+-            new_soft = min(max(soft, target), hard)
+-            if new_soft != soft:
+-                resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+-                logger.info(
+-                    "Raised RLIMIT_NOFILE: %d -> %d (hard=%d)", soft, new_soft, hard
+-                )
+-        except Exception as exc:
+-            logger.warning("Failed to raise RLIMIT_NOFILE: %s", exc)
+-
+-    @staticmethod
+-    def cleanup_ipc_socket(server_addr: str, logger: logging.Logger) -> None:
+-        """Remove stale ipc:// socket files if present."""
+-        if not server_addr.startswith("ipc://"):
+-            return
+-
+-        path = server_addr[len("ipc://") :]
+-        try:
+-            if os.path.exists(path):
+-                os.unlink(path)
+-                logger.info("Removed stale ipc socket: %s", path)
+-        except Exception as exc:
+-            logger.warning("Failed to remove ipc socket %s: %s", path, exc)
+-
+-    @staticmethod
+-    def log_port_occupancy(
+-        server_addr: str, dealer_port: int, logger: logging.Logger
+-    ) -> None:
+-        """Log processes listening on the dealer port to surface conflicts early."""
+-        if not server_addr.startswith("tcp://"):
+-            return
+-
+-        try:
+-            result = subprocess.run(
+-                ["lsof", "-nP", f"-iTCP:{dealer_port}", "-sTCP:LISTEN"],
+-                capture_output=True,
+-                text=True,
+-                timeout=5,
+-            )
+-            if result.returncode == 0 and result.stdout.strip():
+-                logger.info(
+-                    "Port %d is already in LISTEN state:\n%s",
+-                    dealer_port,
+-                    result.stdout,
+-                )
+-        except Exception as exc:
+-            # Best-effort check only; log at debug to avoid noise when lsof is missing.
+-            logger.debug("Port occupancy check failed: %s", exc)
+-
+     @staticmethod
+     def compute_max_clients_for_soft_limit(soft_limit: int) -> int:
+         """Compute a conservative maximum client count for a given soft FD limit.
+@@ -1495,22 +1221,10 @@ class ResourceManager:
+             return 0
+ 
+     @staticmethod
+-    def setup_signal_handlers(handler: Callable[[int, Any], None]) -> None:
++    def setup_signal_handlers(handler):
+         """Setup signal handlers for clean shutdown."""
+-        try:
+-            signal.signal(signal.SIGINT, handler)
+-        except Exception:
+-            pass
+-        if hasattr(signal, "SIGTERM"):
+-            try:
+-                signal.signal(signal.SIGTERM, handler)
+-            except Exception:
+-                pass
+-        if hasattr(signal, "SIGBREAK"):
+-            try:
+-                signal.signal(signal.SIGBREAK, handler)
+-            except Exception:
+-                pass
++        signal.signal(signal.SIGINT, handler)
++        signal.signal(signal.SIGTERM, handler)
+ 
+ 
+ # ============================================================================
+@@ -1531,8 +1245,7 @@ class ClientSimulator:
+         spawn_batch_size: int | None = None,
+         spawn_batch_interval: float | None = None,
+         simulate_battery: bool = True,
+-        enable_receive: bool = True,
+-        transform_send_rate: float = 10.0,
++        enable_receive: bool = False,
+     ):
+         self.server_addr = server_addr
+         self.dealer_port = dealer_port
+@@ -1545,85 +1258,22 @@ class ClientSimulator:
+         )
+         self.simulate_battery = simulate_battery
+         self.enable_receive = enable_receive
+-        self.transform_send_rate = transform_send_rate
+ 
+-        self.context = zmq.Context(io_threads=1)
++        self.context = zmq.Context()
+         self.thread_pool = ClientThreadPool(num_clients)
+         self.running = False
+-        self._stop_requested = threading.Event()
+-        self._stop_lock = threading.Lock()
+-        self._stopped = False
+         self.logger = logging.getLogger(self.__class__.__name__)
+         self.shared_subscriber: SharedSubscriber | None = None
+-        self._sockets: set[zmq.Socket[Any]] = set()
+-        self._sockets_lock = threading.Lock()
+-
+-        # Startup preflight checks and cleanup
+-        self._preflight_checks()
+ 
+         # Setup signal handlers
+         ResourceManager.setup_signal_handlers(self._signal_handler)
+ 
+-        # Best-effort cleanup on interpreter exit
+-        atexit.register(self._atexit_cleanup)
+-
+-    def _preflight_checks(self) -> None:
+-        """Run startup checks to avoid stale resources and port conflicts."""
+-        ResourceManager.bump_fd_soft_limit(
+-            ResourceManager.DEFAULT_FD_LIMIT, self.logger
+-        )
+-        ResourceManager.cleanup_ipc_socket(self.server_addr, self.logger)
+-        ResourceManager.log_port_occupancy(
+-            self.server_addr, self.dealer_port, self.logger
+-        )
+-
+-    def _register_socket(self, socket: zmq.Socket[Any]) -> None:
+-        with self._sockets_lock:
+-            self._sockets.add(socket)
+-
+-    def _unregister_socket(self, socket: zmq.Socket[Any]) -> None:
+-        with self._sockets_lock:
+-            self._sockets.discard(socket)
+-
+-    def _cleanup_tracked_sockets(self) -> None:
+-        with self._sockets_lock:
+-            for socket in list(self._sockets):
+-                try:
+-                    socket.close()
+-                except Exception:
+-                    pass
+-            self._sockets.clear()
+-
+-    def _signal_handler(self, signum: int, frame: types.FrameType | None) -> None:
++    def _signal_handler(self, signum, frame):
+         """Handle interrupt signals."""
+-        self.logger.info(f"\nReceived signal {signum}, requesting stop...")
+-        self.request_stop()
++        self.logger.info(f"\nReceived signal {signum}, stopping simulation...")
+         self.stop()
+ 
+-    def request_stop(self) -> None:
+-        """Request shutdown from non-blocking contexts (signal handlers, etc.)."""
+-        self._stop_requested.set()
+-        self.running = False
+-
+-    def _atexit_cleanup(self) -> None:
+-        """Best-effort cleanup at process exit."""
+-        try:
+-            self.request_stop()
+-            self.stop()
+-        except Exception:
+-            pass
+-        finally:
+-            try:
+-                self._cleanup_tracked_sockets()
+-            except Exception:
+-                pass
+-            try:
+-                if not getattr(self.context, "closed", False):
+-                    self.context.term()
+-            except Exception:
+-                pass
+-
+-    def start(self) -> None:
++    def start(self):
+         """Start the simulation."""
+         self.running = True
+ 
+@@ -1689,12 +1339,7 @@ class ClientSimulator:
+         # Start shared subscriber for ID mappings (single SUB for all clients)
+         if not self.enable_receive:
+             self.shared_subscriber = SharedSubscriber(
+-                self.context,
+-                self.server_addr,
+-                self.sub_port,
+-                self.room_id,
+-                socket_register=self._register_socket,
+-                socket_unregister=self._unregister_socket,
++                self.context, self.server_addr, self.sub_port, self.room_id
+             )
+             if not self.shared_subscriber.start():
+                 self.logger.warning(
+@@ -1736,8 +1381,6 @@ class ClientSimulator:
+                 enable_sub=(
+                     shared_sub is None or self.enable_receive
+                 ),  # disable per-client SUB if shared is running and recv disabled
+-                socket_register=self._register_socket,
+-                socket_unregister=self._unregister_socket,
+             )
+ 
+             # Create client
+@@ -1748,7 +1391,6 @@ class ClientSimulator:
+                 shared_subscriber=shared_sub,
+                 simulate_battery=self.simulate_battery,
+                 enable_receive=self.enable_receive,
+-                transform_send_rate=self.transform_send_rate,
+             )
+ 
+             # Add to thread pool
+@@ -1785,8 +1427,6 @@ class ClientSimulator:
+         # Run until interrupted
+         try:
+             while self.running:
+-                if self._stop_requested.is_set():
+-                    break
+                 active = self.thread_pool.get_active_count()
+                 if active == 0:
+                     self.logger.info("All clients stopped")
+@@ -1797,12 +1437,10 @@ class ClientSimulator:
+         finally:
+             self.stop()
+ 
+-    def stop(self) -> None:
++    def stop(self):
+         """Stop the simulation."""
+-        with self._stop_lock:
+-            if self._stopped:
+-                return
+-            self._stopped = True
++        if not self.running:
++            return
+ 
+         self.running = False
+         self.logger.info("Stopping simulation...")
+@@ -1817,16 +1455,9 @@ class ClientSimulator:
+         except Exception as e:
+             self.logger.error(f"Error stopping SharedSubscriber: {e}")
+ 
+-        # Ensure every tracked socket is closed before terminating context
+-        try:
+-            self._cleanup_tracked_sockets()
+-        except Exception as e:
+-            self.logger.debug(f"Socket cleanup encountered an error: {e}")
+-
+         # Cleanup ZMQ context
+         try:
+-            if not getattr(self.context, "closed", False):
+-                self.context.term()
++            self.context.term()
+         except Exception as e:
+             self.logger.error(f"Error terminating ZMQ context: {e}")
+ 
+@@ -1838,7 +1469,7 @@ class ClientSimulator:
+ # ============================================================================
+ 
+ 
+-def main() -> None:
++def main():
+     """Main entry point for the client simulator."""
+     parser = argparse.ArgumentParser(
+         description="STYLY NetSync Client Simulator - Load testing tool",
+@@ -1860,8 +1491,8 @@ Examples:
+     parser.add_argument(
+         "--server",
+         type=str,
+-        default="localhost",
+-        help="Server address (default: localhost)",
++        default="tcp://localhost",
++        help="Server address (default: tcp://localhost)",
+     )
+     parser.add_argument(
+         "--dealer-port",
+@@ -1906,18 +1537,13 @@ Examples:
+         help="Disable battery level synchronization",
+     )
+     parser.add_argument(
+-        "--transform-send-rate",
+-        type=float,
+-        default=10.0,
+-        help="Transform update send rate in Hz (default: 10.0)",
++        "--enable-recv",
++        action="store_true",
++        help="Enable per-client SUB sockets and track incoming broadcasts",
+     )
+ 
+     args = parser.parse_args()
+ 
+-    # Normalize server address format: accept both "localhost" and "tcp://localhost"
+-    if not args.server.startswith("tcp://") and not args.server.startswith("ipc://"):
+-        args.server = f"tcp://{args.server}"
+-
+     # Configure logging
+     logging.basicConfig(
+         level=getattr(logging, args.log_level),
+@@ -1941,8 +1567,7 @@ Examples:
+         spawn_batch_size=args.spawn_batch_size,
+         spawn_batch_interval=args.spawn_batch_interval,
+         simulate_battery=not args.no_sync_battery,
+-        enable_receive=True,  # Always enable receive (was args.enable_recv)
+-        transform_send_rate=args.transform_send_rate,
++        enable_receive=args.enable_recv,
+     )
+ 
+     try:

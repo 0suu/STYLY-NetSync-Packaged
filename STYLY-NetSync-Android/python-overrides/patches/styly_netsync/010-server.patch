@@ -1,0 +1,1776 @@
+diff --git a/styly_netsync/server.py b/styly_netsync/server.py
+index 2ca2feb..7d4f2ca 100755
+--- a/styly_netsync/server.py
++++ b/styly_netsync/server.py
+@@ -15,6 +15,7 @@ if sys.version_info < MIN_PY:
+ import argparse
+ import base64
+ import json
++import logging
+ import os
+ import platform
+ import socket
+@@ -24,38 +25,28 @@ import traceback
+ from functools import lru_cache
+ from pathlib import Path
+ from queue import Empty, Full, Queue
+-import struct
+-from types import ModuleType
+-from typing import Any, TYPE_CHECKING, cast
+-
+-import zmq.sugar.socket
+-
+-resource: ModuleType | None
+-try:
+-    import resource as _resource
+-
+-    resource = _resource
+-except Exception:
+-    resource = None
++from typing import Any, TYPE_CHECKING
+ 
+ import zmq
+ from loguru import logger
+ from . import binary_serializer
+ from . import network_utils
+ from .logging_utils import configure_logging
+-from .config import (
+-    ConfigurationError,
+-    DefaultConfigError,
+-    ServerConfig,
+-    create_config_from_args,
+-    load_default_config,
+-)
+ 
+ if TYPE_CHECKING:
+     from uvicorn import Server
+ 
+-# Note: Default values are defined in default.toml, not in code.
+-# Use load_default_config() from config module to get defaults.
++DEFAULT_DEALER_PORT = 5555
++DEFAULT_PUB_PORT = 5556
++DEFAULT_SERVER_DISCOVERY_PORT = 9999
++DEFAULT_SERVER_NAME = "STYLY-NetSync-Server"
++
++
++def _env_flag(name: str, default: bool = False) -> bool:
++    raw = os.getenv(name)
++    if raw is None:
++        return default
++    return raw.strip().lower() in {"1", "true", "yes", "on"}
+ 
+ 
+ def valid_port(value: str) -> int:
+@@ -109,7 +100,7 @@ def get_version() -> str:
+                     data = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+                     v = (data.get("project") or {}).get("version")
+                     if v:
+-                        return cast(str, v)
++                        return v
+                 except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError):
+                     # Continue to next fallback if TOML parsing fails
+                     pass
+@@ -134,7 +125,7 @@ def get_version() -> str:
+                 data = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+                 v = (data.get("project") or {}).get("version")
+                 if v:
+-                    return cast(str, v)
++                    return v
+             except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError):
+                 pass
+             break
+@@ -143,125 +134,56 @@ def get_version() -> str:
+ 
+ 
+ class NetSyncServer:
+-    # Note: All default values are defined in default.toml, not in code.
+-    # The BROADCAST_CHECK_INTERVAL is derived from transform_broadcast_rate in config.
+-
+-    # Non-configurable constants
+-    ROUTER_BACKLOG = 512  # Accept queue depth for DEALER/ROUTER connections
+-    PUB_BACKLOG = 512  # Accept queue depth for SUB connections
+-    DEFAULT_FD_LIMIT = 4096
+-    ID_MAPPING_DEBOUNCE_INTERVAL = 0.5  # Debounce ID mapping broadcasts (500ms)
+-
+-    # Control traffic priority settings:
+-    # - CTRL_DRAIN_BATCH: Max control messages (RPC/NV) to drain per publisher loop
+-    # - CTRL_BACKLOG_WATERMARK: Skip transform work when control queue exceeds this
+-    # - TRANSFORM_BUDGET_BYTES_PER_SEC: Token bucket rate limit for transform broadcasts
+-    # - BACKLOG_SLEEP_SEC: Sleep duration when control backlog is high (5ms)
+-    # - MAX_COALESCE_BUFFER_SIZE: Max rooms in coalesce buffer before dropping oldest
+-    # - ROUTER_CTRL_DRAIN_BATCH: Max control messages to drain via ROUTER per receive loop
+-    # - ROUTER_CTRL_QUEUE_MAXSIZE: Max size for router control queue (ring buffer)
+-    CTRL_DRAIN_BATCH = 256
+-    ROUTER_CTRL_DRAIN_BATCH = 64
+-    ROUTER_CTRL_QUEUE_MAXSIZE = 1024
+-    CTRL_BACKLOG_WATERMARK = 500
+-    TRANSFORM_BUDGET_BYTES_PER_SEC = 15_000_000
+-    BACKLOG_SLEEP_SEC = 0.005
+-    MAX_COALESCE_BUFFER_SIZE = 1000
++    # Performance and timing constants
++    BASE_BROADCAST_INTERVAL = 0.1  # 10Hz base rate
++    IDLE_BROADCAST_INTERVAL = 0.5  # 2Hz when idle
++    DIRTY_THRESHOLD = 0.05  # 20Hz max rate when very active
++    BROADCAST_CHECK_INTERVAL = 0.05  # Check broadcasts every 50ms
++    CLEANUP_INTERVAL = 1.0  # Cleanup every 1 second
++    STATUS_LOG_INTERVAL = 10.0  # Log status every 10 seconds
++    MAIN_LOOP_SLEEP = 0.02  # 50Hz main loop sleep
++    CLIENT_TIMEOUT: float | None = None  # Disabled on Android by default
++    DEVICE_ID_EXPIRY_TIME = (
++        300.0  # 5 minutes - remove device ID mappings after this time
++    )
++    POLL_TIMEOUT = 100  # ZMQ poll timeout in ms
++    NV_FLUSH_LOG_THRESHOLD_MS = 20.0  # Log only unusually slow NV flushes
+ 
+     def __init__(
+         self,
+-        dealer_port: int | None = None,
+-        pub_port: int | None = None,
+-        enable_server_discovery: bool | None = None,
+-        server_discovery_port: int | None = None,
+-        server_name: str | None = None,
+-        config: ServerConfig | None = None,
++        dealer_port: int = DEFAULT_DEALER_PORT,
++        pub_port: int = DEFAULT_PUB_PORT,
++        enable_server_discovery: bool = True,
++        server_discovery_port: int = DEFAULT_SERVER_DISCOVERY_PORT,
++        server_name: str = DEFAULT_SERVER_NAME,
+     ):
+-        # Load default config if not provided
+-        if config is None:
+-            config = load_default_config()
+-
+-        # Store config for reference
+-        self._config = config
+-
+-        # Apply overrides from individual arguments (for backward compatibility)
+-        self.dealer_port = (
+-            dealer_port if dealer_port is not None else config.dealer_port
+-        )
+-        self.pub_port = pub_port if pub_port is not None else config.pub_port
++        self.dealer_port = dealer_port
++        self.pub_port = pub_port
+         self.context = zmq.Context()
+ 
+-        # Initialize timing settings from config
+-        self.IDLE_BROADCAST_INTERVAL = config.idle_broadcast_interval
+-        # Convert transform_broadcast_rate (Hz) to interval (seconds)
+-        broadcast_interval = 1.0 / config.transform_broadcast_rate
+-        self.DIRTY_THRESHOLD = broadcast_interval
+-        self.BROADCAST_CHECK_INTERVAL = broadcast_interval
+-        self.CLEANUP_INTERVAL = config.cleanup_interval
+-        self.STATUS_LOG_INTERVAL = config.status_log_interval
+-        self.MAIN_LOOP_SLEEP = config.main_loop_sleep
+-        self.CLIENT_TIMEOUT = config.client_timeout
+-        self.DEVICE_ID_EXPIRY_TIME = config.device_id_expiry_time
+-        self.EMPTY_ROOM_EXPIRY_TIME = config.empty_room_expiry_time
+-        self.POLL_TIMEOUT = config.poll_timeout
+-
+-        # Server discovery settings (with override support)
+-        self.enable_server_discovery = (
+-            enable_server_discovery
+-            if enable_server_discovery is not None
+-            else config.enable_server_discovery
+-        )
+-        self.server_discovery_port = (
+-            server_discovery_port
+-            if server_discovery_port is not None
+-            else config.server_discovery_port
+-        )
+-        self.server_name = (
+-            server_name if server_name is not None else config.server_name
+-        )
+-        self.server_discovery_socket: socket.socket | None = None
+-        self.server_discovery_thread: threading.Thread | None = None
++        # Server discovery settings
++        self.enable_server_discovery = enable_server_discovery
++        self.server_discovery_port = server_discovery_port
++        self.server_name = server_name
++        self.server_discovery_socket = None
++        self.server_discovery_thread = None
+         self.server_discovery_running = False
+ 
+         # TCP server discovery settings
+-        self.tcp_server_discovery_socket: socket.socket | None = None
+-        self.tcp_server_discovery_thread: threading.Thread | None = None
++        self.tcp_server_discovery_socket = None
++        self.tcp_server_discovery_thread = None
+         self.tcp_server_discovery_running = False
+ 
+         # Sockets
+-        self.router: zmq.sugar.socket.Socket[bytes] | None = None
+-        self.pub: zmq.sugar.socket.Socket[bytes] | None = (
+-            None  # Will be created/owned by Publisher thread only
+-        )
++        self.router = None
++        self.pub = None  # Will be created/owned by Publisher thread only
+ 
+         # Publisher thread infrastructure
+-        self._pub_queue_ctrl: Queue[tuple[bytes | None, bytes | None]] = Queue(
+-            maxsize=config.pub_queue_maxsize
+-        )
+-        self._publisher_thread: threading.Thread | None = None
++        self._pub_queue = Queue(maxsize=10000)  # tuneable
++        self._publisher_thread = None
+         self._publisher_running = False
+         self._pub_ready = threading.Event()  # signaled after successful bind
+-        self._publisher_exception: Exception | None = None  # bind/run errors stored
+-        self._transform_tokens = float(self.TRANSFORM_BUDGET_BYTES_PER_SEC)
+-        self._transform_last_refill = time.monotonic()
+-        self._transform_budget_lock = threading.Lock()
+-
+-        # Router control queue for unicast control messages (RPC/NV/ID mapping)
+-        # Format: (identity, room_id_bytes, message_bytes)
+-        self._router_queue_ctrl: Queue[tuple[bytes, bytes, bytes]] = Queue(
+-            maxsize=self.ROUTER_CTRL_QUEUE_MAXSIZE
+-        )
+-
+-        # Statistics for router control messages
+-        self.ctrl_unicast_sent = 0
+-        self.ctrl_unicast_wouldblock = 0
+-        self.ctrl_unicast_dropped = 0
+-
+-        # PUB socket monitor for tracking SUB connections
+-        self._pub_monitor: zmq.sugar.socket.Socket[bytes] | None = None
+-        self._pub_monitor_thread: threading.Thread | None = None
+-        self._sub_connection_count = 0
+-        self._sub_connection_lock = threading.Lock()
++        self._publisher_exception = None  # bind/run errors are stored here
+ 
+         # Latest-only coalescing buffer for high-rate topics (e.g., room transforms)
+         self._coalesce_lock = threading.Lock()
+@@ -278,9 +200,9 @@ class NetSyncServer:
+         self.room_last_broadcast: dict[str, float] = (
+             {}
+         )  # Track last broadcast time per room
+-        self.client_transform_body_cache: dict[int, bytes] = (
++        self.client_binary_cache: dict[str, bytes] = (
+             {}
+-        )  # Cache client_no -> body data (room transform without deviceId)
++        )  # Cache client_no -> binary data
+ 
+         # Client number management per room
+         self.room_client_no_counters: dict[str, int] = {}  # room_id -> next_client_no
+@@ -294,19 +216,6 @@ class NetSyncServer:
+             {}
+         )  # device_id -> last_seen_timestamp
+ 
+-        # Empty room tracking for delayed removal
+-        self.room_empty_since: dict[str, float] = (
+-            {}
+-        )  # room_id -> timestamp when room became empty
+-
+-        # ID Mapping broadcast debouncing
+-        self.room_id_mapping_dirty: dict[str, bool] = (
+-            {}
+-        )  # room_id -> needs ID mapping broadcast
+-        self.room_last_id_mapping_broadcast: dict[str, float] = (
+-            {}
+-        )  # room_id -> last broadcast timestamp
+-
+         # Network Variables storage
+         self.global_variables: dict[str, dict[str, Any]] = (
+             {}
+@@ -323,20 +232,20 @@ class NetSyncServer:
+             {}
+         )  # room_id -> {(target_client_no, var_name): (sender_client_no, value, timestamp)}
+ 
+-        # NV flush cadence configuration (from config)
+-        self.nv_flush_interval = config.nv_flush_interval
++        # NV flush cadence configuration
++        self.nv_flush_interval = 0.05  # 50ms flush cadence
+         self.room_last_nv_flush: dict[str, float] = {}  # room_id -> last_flush_time
+ 
+-        # NV monitoring window (sliding window for logging only)
++        # NV monitoring window (1s sliding window for logging only)
+         self.nv_monitor_window: dict[str, list] = {}  # room_id -> [timestamps]
+-        self.nv_monitor_window_size = config.nv_monitor_window_size
+-        self.nv_monitor_threshold = config.nv_monitor_threshold
++        self.nv_monitor_window_size = 1.0  # 1 second window
++        self.nv_monitor_threshold = 200  # Log warning if > 200 NV req/s
+ 
+-        # Network Variables limits (from config)
+-        self.MAX_GLOBAL_VARS = config.max_global_vars
+-        self.MAX_CLIENT_VARS = config.max_client_vars
+-        self.MAX_VAR_NAME_LENGTH = config.max_var_name_length
+-        self.MAX_VAR_VALUE_LENGTH = config.max_var_value_length
++        # Network Variables limits
++        self.MAX_GLOBAL_VARS = 100
++        self.MAX_CLIENT_VARS = 100
++        self.MAX_VAR_NAME_LENGTH = 64
++        self.MAX_VAR_VALUE_LENGTH = 1024
+ 
+         # Thread synchronization
+         self._rooms_lock = threading.RLock()  # Reentrant lock for nested access
+@@ -344,12 +253,11 @@ class NetSyncServer:
+ 
+         # Threading
+         self.running = False
+-        self.receive_thread: threading.Thread | None = None
+-        self.periodic_thread: threading.Thread | None = (
+-            None  # Combined broadcast + cleanup
+-        )
++        self.receive_thread = None
++        self.periodic_thread = None  # Combined broadcast + cleanup
+ 
+         # Performance configuration (now using constants)
++        self.base_broadcast_interval = self.BASE_BROADCAST_INTERVAL
+         self.idle_broadcast_interval = self.IDLE_BROADCAST_INTERVAL
+         self.dirty_threshold = self.DIRTY_THRESHOLD
+ 
+@@ -362,232 +270,53 @@ class NetSyncServer:
+         self._rest_thread: threading.Thread | None = None
+         self._rest_server: Server | None = None
+ 
+-    def _increment_stat(self, stat_name: str, amount: int = 1) -> None:
++    def _increment_stat(self, stat_name: str, amount: int = 1):
+         """Thread-safe increment of statistics"""
+         with self._stats_lock:
+             setattr(self, stat_name, getattr(self, stat_name) + amount)
+ 
+-    def _bump_fd_soft_limit(self, target: int) -> None:
+-        """Best-effort bump of RLIMIT_NOFILE for macOS/Linux."""
+-        if resource is None:
+-            logger.info(
+-                "Skipping FD soft limit bump: 'resource' module not available on this platform."
+-            )
+-            return
+-
+-        try:
+-            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+-            new_soft = min(max(soft, target), hard)
+-            if new_soft != soft:
+-                resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+-            else:
+-                logger.info(
+-                    "FD limits already sufficient (soft=%d, hard=%d)", soft, hard
+-                )
+-        except Exception as exc:
+-            logger.warning("Failed to raise RLIMIT_NOFILE: %s", exc)
+-
+-    def _get_fd_snapshot(self) -> tuple[int | None, int | None, int | None]:
+-        """
+-        Best-effort snapshot of:
+-          - open_fds: current process open FD count
+-          - soft/hard: RLIMIT_NOFILE
+-        """
+-        soft: int | None = None
+-        hard: int | None = None
+-        if resource is not None:
+-            try:
+-                soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+-            except Exception:
+-                pass
+-
+-        open_fds: int | None = None
+-        # macOS: /dev/fd is available. Linux often has it too.
+-        try:
+-            open_fds = len(os.listdir("/dev/fd"))
+-        except Exception:
+-            # fallback (Linux /proc)
+-            try:
+-                open_fds = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+-            except Exception:
+-                pass
+-
+-        return open_fds, soft, hard
+-
+-    def _pub_monitor_loop(self) -> None:
+-        """Monitor PUB socket for SUB connection/disconnection events."""
+-        from zmq.utils.monitor import recv_monitor_message
+-
+-        try:
+-            while self._publisher_running:
+-                pub_monitor = self._pub_monitor
+-                if pub_monitor is None:
+-                    break
+-                try:
+-                    # Poll with timeout to allow checking _publisher_running
+-                    if pub_monitor.poll(100):
+-                        msg = recv_monitor_message(pub_monitor)
+-                        event = msg["event"]
+-                        if event == zmq.EVENT_ACCEPTED:
+-                            with self._sub_connection_lock:
+-                                self._sub_connection_count += 1
+-                                count = self._sub_connection_count
+-                            logger.info(f"SUB connected (total: {count})")
+-                        elif event == zmq.EVENT_DISCONNECTED:
+-                            with self._sub_connection_lock:
+-                                self._sub_connection_count = max(
+-                                    0, self._sub_connection_count - 1
+-                                )
+-                                count = self._sub_connection_count
+-                            logger.info(f"SUB disconnected (total: {count})")
+-                except zmq.ZMQError as e:
+-                    logger.debug("PUB monitor ZMQError: %s", e)
+-                    break
+-        except Exception as e:
+-            logger.error(f"PUB monitor error: {e}")
+-        finally:
+-            pub_monitor = self._pub_monitor
+-            if pub_monitor is not None:
+-                try:
+-                    pub_monitor.close()
+-                except Exception:
+-                    pass
+-                self._pub_monitor = None
+-
+-    def _get_sub_connection_count(self) -> int:
+-        """Get current number of connected SUB sockets."""
+-        with self._sub_connection_lock:
+-            return self._sub_connection_count
+-
+-    def _control_backlog_exceeded(self) -> bool:
+-        """Return True when control queue backlog exceeds watermark."""
+-        return self._pub_queue_ctrl.qsize() > self.CTRL_BACKLOG_WATERMARK
+-
+-    def _refill_transform_tokens(self) -> None:
+-        """Refill token bucket for transform rate limiting (thread-safe)."""
+-        now = time.monotonic()
+-        with self._transform_budget_lock:
+-            elapsed = now - self._transform_last_refill
+-            if elapsed <= 0.0:
+-                return
+-            refill = elapsed * self.TRANSFORM_BUDGET_BYTES_PER_SEC
+-            self._transform_tokens = min(
+-                float(self.TRANSFORM_BUDGET_BYTES_PER_SEC),
+-                self._transform_tokens + refill,
+-            )
+-            self._transform_last_refill = now
+-
+-    def _try_send_transform(self) -> bool:
+-        """Send at most one coalesced transform message if budget allows."""
+-        pub = self.pub
+-        if pub is None:
+-            return False
+-
+-        self._refill_transform_tokens()
+-        with self._coalesce_lock:
+-            if not self._coalesce_latest:
+-                return False
+-            topic_bytes, message_bytes = next(iter(self._coalesce_latest.items()))
+-
+-        sub_count = max(1, self._get_sub_connection_count())
+-        cost = len(message_bytes) * sub_count
+-
+-        with self._transform_budget_lock:
+-            if self._transform_tokens < cost:
+-                return False
+-            # Deduct tokens before sending (optimistic)
+-            self._transform_tokens -= cost
+-
+-        try:
+-            pub.send_multipart([topic_bytes, message_bytes], flags=zmq.DONTWAIT)
+-            self._increment_stat("broadcast_count")
+-            with self._coalesce_lock:
+-                # Remove only if the message is still the latest.
+-                if self._coalesce_latest.get(topic_bytes) == message_bytes:
+-                    del self._coalesce_latest[topic_bytes]
+-            return True
+-        except zmq.Again:
+-            # Refund tokens on failure
+-            with self._transform_budget_lock:
+-                self._transform_tokens += cost
+-            return False
+-        except Exception as exc:
+-            logger.error(f"Publisher failed to send (transform): {exc}")
+-            # Refund tokens on failure
+-            with self._transform_budget_lock:
+-                self._transform_tokens += cost
+-            return False
+-
+-    def _publisher_loop(self) -> None:
++    def _publisher_loop(self):
+         """The only place that owns/uses self.pub and performs ZMQ sends."""
+         try:
+             # Create/bind PUB in this thread to avoid cross-thread use
+             self.pub = self.context.socket(zmq.PUB)
+-            # Set LINGER=0 to prevent FD accumulation during rapid connect/disconnect
+-            self.pub.setsockopt(zmq.LINGER, 0)
+-            try:
+-                self.pub.setsockopt(zmq.BACKLOG, self.PUB_BACKLOG)
+-            except Exception:
+-                pass
+-            try:
+-                # Low SNDHWM (2) ensures we drop stale messages when clients are slow.
+-                # Transform data only needs the latest; queueing old frames wastes bandwidth.
+-                self.pub.setsockopt(zmq.SNDHWM, 2)
+-            except Exception:
+-                # Best effort; ignore if high-water mark option is unsupported
+-                pass
+             self.pub.bind(f"tcp://*:{self.pub_port}")
+-
+-            # Set up socket monitor for tracking SUB connections
+-            self._pub_monitor = self.pub.get_monitor_socket(
+-                zmq.EVENT_ACCEPTED | zmq.EVENT_DISCONNECTED
+-            )
+-            self._pub_monitor.setsockopt(zmq.LINGER, 0)
+-            self._pub_monitor_thread = threading.Thread(
+-                target=self._pub_monitor_loop, name="PubMonitor", daemon=True
+-            )
+-            self._pub_monitor_thread.start()
+-
+             self._pub_ready.set()
+ 
+             while self._publisher_running:
+-                drained = 0
+-                while drained < self.CTRL_DRAIN_BATCH:
+-                    try:
+-                        item = self._pub_queue_ctrl.get_nowait()
+-                    except Empty:
+-                        break
+-
+-                    # Sentinel for shutdown
+-                    if not item or item[0] is None:
+-                        self._publisher_running = False
+-                        break
+-
+-                    topic_bytes, message_bytes = item
++                # 1) Flush coalesced (latest-only) topics first
++                try:
++                    with self._coalesce_lock:
++                        coalesced_items = list(self._coalesce_latest.items())
++                        self._coalesce_latest.clear()
++                except Exception:
++                    coalesced_items = []
+ 
++                for topic_bytes, message_bytes in coalesced_items:
+                     try:
+-                        self.pub.send_multipart(
+-                            [topic_bytes, message_bytes], flags=zmq.DONTWAIT
+-                        )
++                        self.pub.send_multipart([topic_bytes, message_bytes])
+                         self._increment_stat("broadcast_count")
+-                    except zmq.Again:
+-                        # Socket buffer full; drop the message (PUB-SUB is unreliable by design)
+-                        self._increment_stat("control_drop_count")
+                     except Exception as e:
+-                        logger.error(f"Publisher failed to send: {e}")
++                        logger.error(f"Publisher failed to send (coalesced): {e}")
+ 
+-                    drained += 1
++                # 2) Then handle normal queue (RPC / NV etc.)
++                try:
++                    item = self._pub_queue.get(timeout=0.05)
++                except Empty:
++                    continue
+ 
+-                if not self._publisher_running:
++                # Sentinel for shutdown
++                if not item or item[0] is None:
+                     break
+ 
+-                if self._control_backlog_exceeded():
+-                    time.sleep(self.BACKLOG_SLEEP_SEC)
+-                    continue
++                topic_bytes, message_bytes = item
+ 
+-                transform_sent = self._try_send_transform()
+-                if drained == 0 and not transform_sent:
+-                    time.sleep(self.BACKLOG_SLEEP_SEC)
++                try:
++                    self.pub.send_multipart([topic_bytes, message_bytes])
++                    # Count only *actual* sends
++                    self._increment_stat("broadcast_count")
++                except Exception as e:
++                    logger.error(f"Publisher failed to send: {e}")
+ 
+         except Exception as e:
+             # On bind or loop failure, publish the exception and wake starters
+@@ -595,10 +324,6 @@ class NetSyncServer:
+             self._pub_ready.set()
+             logger.error(f"Publisher error during startup/run: {e}")
+         finally:
+-            self._publisher_running = False
+-            if self._pub_monitor_thread:
+-                self._pub_monitor_thread.join(timeout=1.0)
+-                self._pub_monitor_thread = None
+             if self.pub is not None:
+                 try:
+                     self.pub.close()
+@@ -607,103 +332,24 @@ class NetSyncServer:
+                 self.pub = None
+             logger.info("Publisher loop ended")
+ 
+-    def _enqueue_pub(self, topic_bytes: bytes, message_bytes: bytes) -> None:
++    def _enqueue_pub(self, topic_bytes: bytes, message_bytes: bytes):
+         """Thread-safe enqueue of a broadcast for reliable/low-rate messages (RPC/NV).
+         Backpressure policy: drop the oldest item (ring buffer) to prefer newer updates.
+         """
+         try:
+-            self._pub_queue_ctrl.put_nowait((topic_bytes, message_bytes))
++            self._pub_queue.put_nowait((topic_bytes, message_bytes))
+         except Full:
+             # Ring-buffer behavior: remove oldest then enqueue latest
+             try:
+-                _ = self._pub_queue_ctrl.get_nowait()
++                _ = self._pub_queue.get_nowait()
+             except Empty:
+-                # Queue became empty between Full and get_nowait (rare race condition)
+                 pass
+-            else:
+-                # Count and log the drop of the oldest message
+-                self._increment_stat("skipped_broadcasts")
+-                logger.debug("PUB queue full: dropping oldest message")
+             try:
+-                self._pub_queue_ctrl.put_nowait((topic_bytes, message_bytes))
++                self._pub_queue.put_nowait((topic_bytes, message_bytes))
+             except Full:
+-                # If still full after removing one, count as dropped (another drop)
++                # If still full, count as skipped
+                 self._increment_stat("skipped_broadcasts")
+-                logger.debug("PUB queue full: dropping new message")
+-
+-    def _enqueue_router(
+-        self, identity: bytes, room_id: str, message_bytes: bytes
+-    ) -> None:
+-        """Thread-safe enqueue of a control message for unicast via ROUTER.
+-
+-        Used for control-like messages (RPC, NV sync, ID mapping) that are
+-        more reliable than PUB/SUB, but still drop under backpressure and
+-        send failures (ring-buffer drop-on-full and non-blocking router drain).
+-
+-        Args:
+-            identity: Client's ZeroMQ identity (from ROUTER socket)
+-            room_id: Room ID string
+-            message_bytes: Serialized message payload
+-        """
+-        room_bytes = room_id.encode("utf-8")
+-        try:
+-            self._router_queue_ctrl.put_nowait((identity, room_bytes, message_bytes))
+-        except Full:
+-            # Ring-buffer behavior: drop oldest to make room for newest
+-            try:
+-                _ = self._router_queue_ctrl.get_nowait()
+-            except Empty:
+-                # Queue became empty between Full and get_nowait (rare race condition)
+-                pass
+-            else:
+-                # Count and log the drop of the oldest message
+-                self._increment_stat("ctrl_unicast_dropped")
+-                logger.debug(
+-                    "Router control queue full: dropping oldest control message"
+-                )
+-            try:
+-                self._router_queue_ctrl.put_nowait(
+-                    (identity, room_bytes, message_bytes)
+-                )
+-            except Full:
+-                # If still full after removing one, count as dropped (another drop)
+-                self._increment_stat("ctrl_unicast_dropped")
+-                logger.debug("Router control queue full: dropping new message")
+-
+-    def _send_ctrl_to_room_via_router(
+-        self,
+-        room_id: str,
+-        message_bytes: bytes,
+-        exclude_identity: bytes | None = None,
+-    ) -> None:
+-        """Send a control message to all clients in a room via ROUTER unicast.
+-
+-        This method enqueues the message for each client in the room, providing
+-        more reliable delivery than PUB/SUB (though still subject to drops under
+-        backpressure).
+-
+-        Args:
+-            room_id: Room ID to broadcast to
+-            message_bytes: Serialized message payload
+-            exclude_identity: Optional client identity to exclude (e.g., sender)
+-        """
+-        identities_to_send: list[bytes] = []
+-        with self._rooms_lock:
+-            if room_id not in self.rooms:
+-                return
+-
+-            # Collect all client identities in the room while holding the lock
+-            for _device_id, client_data in self.rooms[room_id].items():
+-                identity = client_data.get("identity")
+-                if identity is None:
+-                    continue
+-                if exclude_identity is not None and identity == exclude_identity:
+-                    continue
+-                identities_to_send.append(identity)
+-
+-        # Enqueue control messages outside of the rooms lock to reduce contention
+-        for identity in identities_to_send:
+-            self._enqueue_router(identity, room_id, message_bytes)
++                logger.debug("PUB queue full: dropping a message")
+ 
+     def _get_or_assign_client_no(self, room_id: str, device_id: str) -> int:
+         """Get existing client number or assign a new one for the given device ID in the room"""
+@@ -739,7 +385,7 @@ class NetSyncServer:
+             )
+             return client_no
+ 
+-    def _initialize_room(self, room_id: str) -> None:
++    def _initialize_room(self, room_id: str):
+         """Initialize all room-related data structures"""
+         if room_id not in self.rooms:
+             self.rooms[room_id] = {}
+@@ -763,9 +409,7 @@ class NetSyncServer:
+ 
+             logger.info(f"Created new room: {room_id}")
+ 
+-    def _get_device_id_from_identity(
+-        self, client_identity: bytes, room_id: str
+-    ) -> str | None:
++    def _get_device_id_from_identity(self, client_identity: bytes, room_id: str) -> str:
+         """Get device ID from client identity"""
+         with self._rooms_lock:
+             if room_id in self.rooms:
+@@ -793,9 +437,6 @@ class NetSyncServer:
+                 # Device ID has no last seen time, can reuse
+                 del self.room_client_no_to_device_id[room_id][client_no]
+                 del self.room_device_id_to_client_no[room_id][device_id]
+-                # Clear stale cache entry to prevent broadcasting old transform
+-                if client_no in self.client_transform_body_cache:
+-                    del self.client_transform_body_cache[client_no]
+                 return client_no
+ 
+             if (
+@@ -806,14 +447,11 @@ class NetSyncServer:
+                 del self.room_client_no_to_device_id[room_id][client_no]
+                 del self.room_device_id_to_client_no[room_id][device_id]
+                 del self.device_id_last_seen[device_id]
+-                # Clear stale cache entry to prevent broadcasting old transform
+-                if client_no in self.client_transform_body_cache:
+-                    del self.client_transform_body_cache[client_no]
+                 return client_no
+ 
+         return -1  # No reusable client number found
+ 
+-    def _cleanup_expired_device_id_mappings(self, current_time: float) -> None:
++    def _cleanup_expired_device_id_mappings(self, current_time):
+         """Clean up expired device ID to client number mappings"""
+         with self._rooms_lock:
+             expired_device_ids = []
+@@ -843,27 +481,11 @@ class NetSyncServer:
+                     f"Cleaned up {len(expired_device_ids)} expired device ID mappings"
+                 )
+ 
+-    def start(self, ip_addresses: list[str] | None = None) -> None:
++    def start(self):
+         """Start the server"""
+         try:
+-            # Raise FD soft limit early to avoid connection drops when many clients connect
+-            self._bump_fd_soft_limit(self.DEFAULT_FD_LIMIT)
+-
+             # Setup ROUTER socket
+             self.router = self.context.socket(zmq.ROUTER)
+-            # Set LINGER=0 to prevent FD accumulation during rapid connect/disconnect
+-            self.router.setsockopt(zmq.LINGER, 0)
+-            # Increase accept backlog to survive connection stampedes from simulators
+-            try:
+-                self.router.setsockopt(zmq.BACKLOG, self.ROUTER_BACKLOG)
+-            except Exception:
+-                # Best effort; fall back to default backlog if unsupported
+-                pass
+-            try:
+-                self.router.setsockopt(zmq.RCVHWM, 10000)
+-            except Exception:
+-                # Best effort; ignore if high-water mark option is unsupported
+-                pass
+             self.router.bind(f"tcp://*:{self.dealer_port}")
+ 
+             # Start Publisher thread (it creates/binds PUB)
+@@ -902,24 +524,27 @@ class NetSyncServer:
+             if self.enable_server_discovery:
+                 self._start_server_discovery()
+ 
+-            try:
+-                from .rest_bridge import create_app, run_uvicorn_in_thread
++            if _env_flag("NETSYNC_ENABLE_REST_BRIDGE", default=False):
++                try:
++                    from .rest_bridge import create_app, run_uvicorn_in_thread
+ 
+-                app = create_app(
+-                    server_addr="tcp://127.0.0.1",
+-                    dealer_port=self.dealer_port,
+-                    sub_port=self.pub_port,
+-                )
+-                rest_port = int(os.getenv("NETSYNC_REST_PORT", "8800"))
+-                self._rest_thread, self._rest_server = run_uvicorn_in_thread(
+-                    app, host="0.0.0.0", port=rest_port
+-                )
+-                display_ip = ip_addresses[0] if ip_addresses else "0.0.0.0"
+-                logger.info(f"REST bridge started on http://{display_ip}:{rest_port}")
+-                # Display logo after all initialization is complete
+-                display_logo()
+-            except Exception as rest_exc:
+-                logger.error(f"Failed to start REST bridge: {rest_exc}")
++                    app = create_app(
++                        server_addr="tcp://127.0.0.1",
++                        dealer_port=self.dealer_port,
++                        sub_port=self.pub_port,
++                    )
++                    rest_port = int(os.getenv("NETSYNC_REST_PORT", "8800"))
++                    self._rest_thread, self._rest_server = run_uvicorn_in_thread(
++                        app, host="0.0.0.0", port=rest_port
++                    )
++                    logger.info(f"REST bridge started on http://0.0.0.0:{rest_port}")
++                except Exception as rest_exc:
++                    logger.error(f"Failed to start REST bridge: {rest_exc}")
++            else:
++                logger.info("REST bridge disabled (NETSYNC_ENABLE_REST_BRIDGE=0)")
++
++            # Display logo after all initialization is complete
++            display_logo()
+ 
+             logger.info("Server is ready and waiting for connections...")
+ 
+@@ -957,7 +582,7 @@ class NetSyncServer:
+             logger.error(traceback.format_exc())
+             raise
+ 
+-    def stop(self) -> None:
++    def stop(self):
+         """Stop the server"""
+         logger.info("Stopping server...")
+         self.running = False
+@@ -986,15 +611,15 @@ class NetSyncServer:
+         # Stop Publisher thread
+         self._publisher_running = False
+         try:
+-            self._pub_queue_ctrl.put_nowait((None, None))  # sentinel
++            self._pub_queue.put_nowait((None, None))  # sentinel
+         except Full:
+             # Best-effort to make room, then send sentinel
+             try:
+-                _ = self._pub_queue_ctrl.get_nowait()
++                _ = self._pub_queue.get_nowait()
+             except Empty:
+                 pass
+             try:
+-                self._pub_queue_ctrl.put_nowait((None, None))
++                self._pub_queue.put_nowait((None, None))
+             except Full:
+                 pass
+         if self._publisher_thread:
+@@ -1008,20 +633,15 @@ class NetSyncServer:
+ 
+         logger.info(
+             f"Server stopped. Total messages processed: {self.message_count}, "
+-            f"Broadcasts sent: {self.broadcast_count}, Skipped broadcasts: {self.skipped_broadcasts}, "
+-            f"Control unicasts sent: {self.ctrl_unicast_sent}, "
+-            f"Control unicast wouldblock: {self.ctrl_unicast_wouldblock}, "
+-            f"Control unicast dropped: {self.ctrl_unicast_dropped}"
++            f"Broadcasts sent: {self.broadcast_count}, Skipped broadcasts: {self.skipped_broadcasts}"
+         )
+ 
+-    def _receive_loop(self) -> None:
++    def _receive_loop(self):
+         """Receive messages from clients"""
+         while self.running:
+             try:
+                 # Check for incoming messages
+-                if self.router is not None and self.router.poll(
+-                    self.POLL_TIMEOUT, zmq.POLLIN
+-                ):
++                if self.router.poll(self.POLL_TIMEOUT, zmq.POLLIN):
+                     # Receive multipart message [identity, room_id, message]
+                     parts = self.router.recv_multipart()
+                     self._increment_stat("message_count")
+@@ -1035,14 +655,11 @@ class NetSyncServer:
+                         except UnicodeDecodeError as e:
+                             logger.error(f"Failed to decode room ID: {e}")
+                             continue
+-                        # Protocol v3 binary-only handling (no JSON fallback)
++                        # Try binary first, fallback to JSON for compatibility
+                         try:
+                             msg_type, data, raw_payload = binary_serializer.deserialize(
+                                 message_bytes
+                             )
+-                            if data is None:
+-                                logger.warning("Received message with None data")
+-                                continue
+                             if msg_type == binary_serializer.MSG_CLIENT_POSE:
+                                 self._handle_client_transform(
+                                     client_identity, room_id, data, raw_payload
+@@ -1072,59 +689,26 @@ class NetSyncServer:
+                                 self._monitor_nv_sliding_window(room_id)
+                             else:
+                                 logger.warning(f"Unknown binary msg_type: {msg_type}")
+-                        except Exception as e:
+-                            logger.warning(
+-                                "Failed to decode protocol v3 message from room %s: %s",
+-                                room_id,
+-                                e,
+-                            )
++                        except Exception:
++                            # Fallback to JSON for backward compatibility
++                            try:
++                                message = message_bytes.decode("utf-8")
++                                self._process_message(client_identity, room_id, message)
++                            except UnicodeDecodeError as e:
++                                logger.error(f"Failed to decode message: {e}")
+ 
+                     else:
+                         logger.warning(
+                             f"Received incomplete message with only {len(parts)} parts"
+                         )
+ 
+-                # Drain control messages via ROUTER after processing incoming
+-                self._drain_router_ctrl_queue()
+-
+             except Exception as e:
+                 logger.error(f"Error in receive loop: {e}")
+                 logger.error(traceback.format_exc())
+ 
+         logger.info("Receive loop ended")
+ 
+-    def _drain_router_ctrl_queue(self) -> None:
+-        """Drain pending control messages from the router queue.
+-
+-        This method sends queued control messages (RPC, NV sync, ID mapping)
+-        via the ROUTER socket to specific clients. It is called from the
+-        receive loop to ensure timely delivery of control messages.
+-        """
+-        router = self.router
+-        if router is None:
+-            return
+-
+-        for _ in range(self.ROUTER_CTRL_DRAIN_BATCH):
+-            try:
+-                ident, room_bytes, msg_bytes = self._router_queue_ctrl.get_nowait()
+-            except Empty:
+-                break
+-
+-            try:
+-                # Send via ROUTER: [identity, room_id, payload]
+-                router.send_multipart(
+-                    [ident, room_bytes, msg_bytes], flags=zmq.DONTWAIT
+-                )
+-                self._increment_stat("ctrl_unicast_sent")
+-            except zmq.Again:
+-                # Socket would block - drop the message (don't re-enqueue)
+-                self._increment_stat("ctrl_unicast_wouldblock")
+-            except Exception as exc:
+-                logger.error(f"Router send error: {exc}")
+-
+-    def _process_message(
+-        self, client_identity: bytes, room_id: str, message: str
+-    ) -> None:
++    def _process_message(self, client_identity: bytes, room_id: str, message: str):
+         """Process incoming client message"""
+         try:
+             msg_data = json.loads(message)
+@@ -1155,16 +739,11 @@ class NetSyncServer:
+         room_id: str,
+         data: dict[str, Any],
+         raw_payload: bytes = b"",
+-    ) -> None:
++    ):
+         """Handle client transform update"""
+-        device_id_raw = data.get("deviceId")  # Receiving device ID from client
+-        if device_id_raw is None or not isinstance(device_id_raw, str):
+-            logger.warning("Received client transform with missing or invalid deviceId")
+-            return
+-        device_id: str = device_id_raw
+-        body_bytes = self._extract_transform_body(raw_payload)
++        device_id = data.get("deviceId")  # Receiving device ID from client
+ 
+-        # Detect stealth mode using flags
++        # Detect stealth mode using NaN handshake
+         is_stealth = binary_serializer._is_stealth_client(data)
+ 
+         # Get or assign client number for this device ID
+@@ -1190,8 +769,10 @@ class NetSyncServer:
+                     "is_stealth": is_stealth,
+                 }
+                 self.room_dirty_flags[room_id] = True  # Mark room as dirty
+-                if body_bytes:
+-                    self.client_transform_body_cache[client_no] = body_bytes
++                # Cache the binary data if available
++                if raw_payload:
++                    # Store by client number for efficient broadcast
++                    self.client_binary_cache[client_no] = raw_payload
+                 stealth_text = " (stealth mode)" if is_stealth else ""
+                 logger.info(
+                     f"New client {device_id[:8]}... (client number: {client_no}){stealth_text} joined room {room_id}"
+@@ -1203,30 +784,20 @@ class NetSyncServer:
+                 self.rooms[room_id][device_id]["client_no"] = client_no
+                 self.rooms[room_id][device_id]["is_stealth"] = is_stealth
+ 
+-                if body_bytes:
+-                    self.client_transform_body_cache[client_no] = body_bytes
++                # Update cached binary data if available
++                if raw_payload:
++                    self.client_binary_cache[client_no] = raw_payload
+ 
+                 # Mark room as dirty since transform data has arrived
+                 self.room_dirty_flags[room_id] = True
+ 
+-            # Mark room for debounced ID mapping broadcast when a new client joins
+-            if is_new_client:
+-                self.room_id_mapping_dirty[room_id] = True
+-
+-        # Sync network variables to new client (outside lock to avoid deadlocks)
++        # Broadcast ID mappings and Network Variables when a new client joins (outside of lock)
+         if is_new_client:
++            self._broadcast_id_mappings(room_id)
+             self._sync_network_variables_to_new_client(room_id)
+ 
+-    def _extract_transform_body(self, raw_payload: bytes) -> bytes:
+-        """Extract the transform body without device ID from raw payload."""
+-        return raw_payload or b""
+-
+-    def _send_rpc_to_room(self, room_id: str, rpc_data: dict[str, Any]) -> None:
+-        """Send RPC to all clients in room via ROUTER unicast.
+-
+-        RPC messages are sent via ROUTER for reliable delivery to each client,
+-        rather than via PUB which can drop messages under load.
+-        """
++    def _send_rpc_to_room(self, room_id: str, rpc_data: dict[str, Any]):
++        """Send RPC to all clients in room except sender"""
+         # Log RPC
+         sender_client_no = rpc_data.get("senderClientNo", 0)
+         function_name = rpc_data.get("functionName", "unknown")
+@@ -1235,13 +806,14 @@ class NetSyncServer:
+             f"RPC: sender={sender_client_no}, function={function_name}, args={args}, room={room_id}"
+         )
+ 
+-        # Serialize the RPC message
++        # Prepare topic and payload
++        topic_bytes = room_id.encode("utf-8")
+         message_bytes = binary_serializer.serialize_rpc_message(rpc_data)
+ 
+-        # Send via ROUTER unicast to all clients in the room
+-        self._send_ctrl_to_room_via_router(room_id, message_bytes)
++        # Send multipart [roomId, payload]
++        self._enqueue_pub(topic_bytes, message_bytes)
+ 
+-    def _monitor_nv_sliding_window(self, room_id: str) -> None:
++    def _monitor_nv_sliding_window(self, room_id: str):
+         """Monitor NV request rate for logging only (no gating)"""
+         current_time = time.monotonic()
+         with self._rooms_lock:
+@@ -1263,7 +835,7 @@ class NetSyncServer:
+                     f"High NV request rate in room {room_id}: {len(self.nv_monitor_window[room_id])} req/s"
+                 )
+ 
+-    def _buffer_global_var_set(self, room_id: str, data: dict[str, Any]) -> None:
++    def _buffer_global_var_set(self, room_id: str, data: dict[str, Any]):
+         """Buffer global variable set request for later processing"""
+         sender_client_no = data.get("senderClientNo", 0)
+         var_name = data.get("variableName", "")[: self.MAX_VAR_NAME_LENGTH]
+@@ -1326,7 +898,7 @@ class NetSyncServer:
+             )
+             return True
+ 
+-    def _handle_global_var_set(self, room_id: str, data: dict[str, Any]) -> None:
++    def _handle_global_var_set(self, room_id: str, data: dict[str, Any]):
+         """Handle global variable set request (for backward compat - immediate apply+broadcast)"""
+         sender_client_no = data.get("senderClientNo", 0)
+         var_name = data.get("variableName", "")[: self.MAX_VAR_NAME_LENGTH]
+@@ -1342,7 +914,7 @@ class NetSyncServer:
+             # Broadcast sync to all clients
+             self._broadcast_global_var_sync(room_id)
+ 
+-    def _buffer_client_var_set(self, room_id: str, data: dict[str, Any]) -> None:
++    def _buffer_client_var_set(self, room_id: str, data: dict[str, Any]):
+         """Buffer client variable set request for later processing"""
+         sender_client_no = data.get("senderClientNo", 0)
+         target_client_no = data.get("targetClientNo", 0)
+@@ -1415,7 +987,7 @@ class NetSyncServer:
+             )
+             return True
+ 
+-    def _handle_client_var_set(self, room_id: str, data: dict[str, Any]) -> None:
++    def _handle_client_var_set(self, room_id: str, data: dict[str, Any]):
+         """Handle client variable set request (for backward compat - immediate apply+broadcast)"""
+         sender_client_no = data.get("senderClientNo", 0)
+         target_client_no = data.get("targetClientNo", 0)
+@@ -1432,12 +1004,8 @@ class NetSyncServer:
+             # Broadcast sync to all clients
+             self._broadcast_client_var_sync(room_id)
+ 
+-    def _broadcast_global_var_sync(self, room_id: str) -> None:
+-        """Broadcast global variables sync to all clients in room via ROUTER unicast.
+-
+-        Network Variable syncs are sent via ROUTER for reliable delivery to each client,
+-        rather than via PUB which can drop messages under load.
+-        """
++    def _broadcast_global_var_sync(self, room_id: str):
++        """Broadcast global variables sync to all clients in room"""
+         with self._rooms_lock:
+             if room_id not in self.global_variables:
+                 return
+@@ -1454,22 +1022,17 @@ class NetSyncServer:
+                 )
+ 
+             if variables:
++                topic_bytes = room_id.encode("utf-8")
+                 message_bytes = binary_serializer.serialize_global_var_sync(
+                     {"variables": variables}
+                 )
+-                # Send via ROUTER unicast (lock is held, but _send_ctrl_to_room_via_router
+-                # will acquire the lock again - RLock allows this)
+-                self._send_ctrl_to_room_via_router(room_id, message_bytes)
++                self._enqueue_pub(topic_bytes, message_bytes)
+                 logger.debug(
+                     f"Broadcasted {len(variables)} global variables to room {room_id}"
+                 )
+ 
+-    def _broadcast_client_var_sync(self, room_id: str) -> None:
+-        """Broadcast client variables sync to all clients in room via ROUTER unicast.
+-
+-        Network Variable syncs are sent via ROUTER for reliable delivery to each client,
+-        rather than via PUB which can drop messages under load.
+-        """
++    def _broadcast_client_var_sync(self, room_id: str):
++        """Broadcast client variables sync to all clients in room"""
+         with self._rooms_lock:
+             if room_id not in self.client_variables:
+                 return
+@@ -1490,17 +1053,16 @@ class NetSyncServer:
+                     client_variables[str(client_no)] = client_vars
+ 
+             if client_variables:
++                topic_bytes = room_id.encode("utf-8")
+                 message_bytes = binary_serializer.serialize_client_var_sync(
+                     {"clientVariables": client_variables}
+                 )
+-                # Send via ROUTER unicast (lock is held, but _send_ctrl_to_room_via_router
+-                # will acquire the lock again - RLock allows this)
+-                self._send_ctrl_to_room_via_router(room_id, message_bytes)
++                self._enqueue_pub(topic_bytes, message_bytes)
+                 logger.debug(
+                     f"Broadcasted client variables for {len(client_variables)} clients to room {room_id}"
+                 )
+ 
+-    def _sync_network_variables_to_new_client(self, room_id: str) -> None:
++    def _sync_network_variables_to_new_client(self, room_id: str):
+         """Send current Network Variables state to a newly connected client"""
+         self._broadcast_global_var_sync(room_id)
+         self._broadcast_client_var_sync(room_id)
+@@ -1536,7 +1098,7 @@ class NetSyncServer:
+                     }
+                 )
+ 
+-        # Send NV syncs via ROUTER unicast for reliable delivery
++        topic = room_id.encode("utf-8")
+         if applied_globals:
+             vars_payload = []
+             with self._rooms_lock:
+@@ -1553,27 +1115,21 @@ class NetSyncServer:
+             msg = binary_serializer.serialize_global_var_sync(
+                 {"variables": vars_payload}
+             )
+-            self._send_ctrl_to_room_via_router(room_id, msg)
++            self._enqueue_pub(topic, msg)
+ 
+         if applied_clients:
+             client_vars = {str(cno): lst for cno, lst in applied_clients.items()}
+             msg = binary_serializer.serialize_client_var_sync(
+                 {"clientVariables": client_vars}
+             )
+-            self._send_ctrl_to_room_via_router(room_id, msg)
++            self._enqueue_pub(topic, msg)
+ 
+         elapsed_ms = (time.perf_counter() - start) * 1000.0
+-        if elapsed_ms > 10.0:
+-            logger.info(f"NV flush took {elapsed_ms:.2f} ms (room={room_id})")
+-        else:
+-            logger.debug(f"NV flush took {elapsed_ms:.2f} ms (room={room_id})")
+-
+-    def _broadcast_id_mappings(self, room_id: str) -> None:
+-        """Broadcast all device ID mappings for a room via ROUTER unicast.
++        if elapsed_ms >= self.NV_FLUSH_LOG_THRESHOLD_MS:
++            logger.warning(f"NV flush took {elapsed_ms:.2f} ms (room={room_id})")
+ 
+-        ID mapping messages are sent via ROUTER for reliable delivery to each client,
+-        rather than via PUB which can drop messages under load.
+-        """
++    def _broadcast_id_mappings(self, room_id: str):
++        """Broadcast all device ID mappings for a room (including stealth clients with flag)"""
+         with self._rooms_lock:
+             if room_id not in self.room_device_id_to_client_no:
+                 return
+@@ -1590,44 +1146,22 @@ class NetSyncServer:
+                 mappings.append((client_no, device_id, is_stealth))
+ 
+             if mappings:
+-                # Serialize and broadcast the mappings with server version
++                # Serialize and broadcast the mappings
++                topic_bytes = room_id.encode("utf-8")
+                 server_version = binary_serializer.parse_version(get_version())
+                 message_bytes = binary_serializer.serialize_device_id_mapping(
+                     mappings, server_version
+                 )
+-                # Send via ROUTER unicast (lock is held, but _send_ctrl_to_room_via_router
+-                # will acquire the lock again - RLock allows this)
+-                self._send_ctrl_to_room_via_router(room_id, message_bytes)
++                self._enqueue_pub(topic_bytes, message_bytes)
+                 logger.info(
+-                    f"Broadcasted {len(mappings)} ID mappings to room {room_id} via ROUTER"
++                    f"Broadcasted {len(mappings)} ID mappings to room {room_id}"
+                 )
+ 
+-    def _flush_debounced_id_mapping_broadcasts(self, current_time: float) -> None:
+-        """Flush ID mapping broadcasts that have been debounced long enough."""
+-        # Get list of rooms that need ID mapping broadcast and mark them as processed
+-        rooms_to_broadcast: list[str] = []
+-        with self._rooms_lock:
+-            for room_id, is_dirty in list(self.room_id_mapping_dirty.items()):
+-                if not is_dirty:
+-                    continue
+-                last_broadcast = self.room_last_id_mapping_broadcast.get(room_id, 0.0)
+-                if current_time - last_broadcast >= self.ID_MAPPING_DEBOUNCE_INTERVAL:
+-                    rooms_to_broadcast.append(room_id)
+-
+-            # Mark rooms as having been broadcast at this time
+-            for room_id in rooms_to_broadcast:
+-                self.room_id_mapping_dirty[room_id] = False
+-                self.room_last_id_mapping_broadcast[room_id] = current_time
+-
+-        # Broadcast ID mappings for eligible rooms outside the lock
+-        for room_id in rooms_to_broadcast:
+-            self._broadcast_id_mappings(room_id)
+-
+-    def _periodic_loop(self) -> None:
++    def _periodic_loop(self):
+         """Combined broadcast and cleanup loop with adaptive rates"""
+-        last_broadcast_check: float = 0.0
+-        last_cleanup: float = 0.0
+-        last_device_id_cleanup: float = 0.0
++        last_broadcast_check = 0
++        last_cleanup = 0
++        last_device_id_cleanup = 0
+         last_log = time.monotonic()
+         DEVICE_ID_CLEANUP_INTERVAL = 60.0  # Clean up expired device IDs every minute
+ 
+@@ -1637,7 +1171,9 @@ class NetSyncServer:
+ 
+                 # Check for broadcasts at higher frequency but only broadcast when needed
+                 if current_time - last_broadcast_check >= self.BROADCAST_CHECK_INTERVAL:
+-                    # Flush Network Variables before other categories
++                    self._adaptive_broadcast_all_rooms(current_time)
++
++                    # Flush Network Variables after other categories
+                     with self._rooms_lock:
+                         rooms = list(self.rooms.keys())
+                     for room_id in rooms:
+@@ -1646,8 +1182,6 @@ class NetSyncServer:
+                             self._flush_nv_drain(room_id)
+                             self.room_last_nv_flush[room_id] = current_time
+ 
+-                    if not self._control_backlog_exceeded():
+-                        self._adaptive_broadcast_all_rooms(current_time)
+                     last_broadcast_check = current_time
+ 
+                 # Cleanup at regular intervals
+@@ -1655,9 +1189,6 @@ class NetSyncServer:
+                     self._cleanup_clients(current_time)
+                     last_cleanup = current_time
+ 
+-                # Debounced ID mapping broadcasts
+-                self._flush_debounced_id_mapping_broadcasts(current_time)
+-
+                 # Clean up expired device ID mappings periodically
+                 if current_time - last_device_id_cleanup >= DEVICE_ID_CLEANUP_INTERVAL:
+                     self._cleanup_expired_device_id_mappings(current_time)
+@@ -1679,21 +1210,10 @@ class NetSyncServer:
+                         1 for flag in self.room_dirty_flags.values() if flag
+                     )
+                     total_device_ids = len(self.device_id_last_seen)
+-
+-                    # Get FD information for status log
+-                    open_fds, soft, _ = self._get_fd_snapshot()
+-                    fd_part = ""
+-                    if open_fds is not None:
+-                        if soft is not None:
+-                            fd_part = f", FD {open_fds}/{soft}"
+-                        else:
+-                            fd_part = f", FD {open_fds}"
+-
+                     logger.info(
+                         f"Status: {len(self.rooms)} rooms, {normal_clients} normal clients, "
+                         f"{stealth_clients} stealth clients, "
+                         f"{dirty_rooms} dirty rooms, {total_device_ids} tracked device IDs"
+-                        f"{fd_part}"
+                     )
+                     last_log = current_time
+ 
+@@ -1704,19 +1224,20 @@ class NetSyncServer:
+ 
+         logger.info("Periodic loop ended")
+ 
+-    def _adaptive_broadcast_all_rooms(self, current_time: float) -> None:
++    def _adaptive_broadcast_all_rooms(self, current_time):
+         """Broadcast room state with adaptive rates based on activity"""
+-        rooms_to_broadcast: list[
+-            tuple[str, list[tuple[int, float, dict[str, Any] | None, bytes]]]
+-        ] = []
+-
+         with self._rooms_lock:
+-            for room_id, clients in self.rooms.items():
+-                if not clients:  # Skip empty rooms
+-                    continue
++            rooms_copy = list(
++                self.rooms.items()
++            )  # Create copy to avoid holding lock too long
+ 
++        for room_id, clients in rooms_copy:
++            if not clients:  # Skip empty rooms
++                continue
++
++            with self._rooms_lock:
+                 # Check if room needs broadcasting
+-                last_broadcast = self.room_last_broadcast.get(room_id, 0.0)
++                last_broadcast = self.room_last_broadcast.get(room_id, 0)
+                 is_dirty = self.room_dirty_flags.get(room_id, False)
+ 
+                 # Calculate time since last broadcast
+@@ -1735,93 +1256,43 @@ class NetSyncServer:
+                         should_broadcast = True
+ 
+                 if should_broadcast:
+-                    client_snapshot = []
+-                    for client_data in clients.values():
+-                        if client_data.get("is_stealth", False):
+-                            continue
+-                        client_no = client_data.get("client_no", 0)
+-                        transform_data = client_data.get("transform_data")
+-                        pose_time = client_data.get("last_update", 0.0)
+-                        body_bytes = self.client_transform_body_cache.get(
+-                            client_no, b""
+-                        )
+-                        client_snapshot.append(
+-                            (client_no, pose_time, transform_data, body_bytes)
+-                        )
+-                    rooms_to_broadcast.append((room_id, client_snapshot))
++                    self._broadcast_room(room_id, clients)
+                     self.room_dirty_flags[room_id] = False  # Clear dirty flag
+                     self.room_last_broadcast[room_id] = current_time
+                 else:
+                     self._increment_stat("skipped_broadcasts")
+ 
+-        for room_id, client_snapshot in rooms_to_broadcast:
+-            self._broadcast_room(room_id, client_snapshot)
+-
+-    def _enqueue_pub_latest(self, topic_bytes: bytes, message_bytes: bytes) -> None:
++    def _enqueue_pub_latest(self, topic_bytes: bytes, message_bytes: bytes):
+         """Latest-only coalescing enqueue for high-rate topics (e.g., room transforms)."""
+         with self._coalesce_lock:
+-            # Prevent unbounded growth: drop oldest entry if buffer exceeds limit
+-            if (
+-                topic_bytes not in self._coalesce_latest
+-                and len(self._coalesce_latest) >= self.MAX_COALESCE_BUFFER_SIZE
+-            ):
+-                oldest_key = next(iter(self._coalesce_latest))
+-                del self._coalesce_latest[oldest_key]
+-                self._increment_stat("skipped_broadcasts")
+             self._coalesce_latest[topic_bytes] = message_bytes
+ 
+-    def _broadcast_room(
+-        self,
+-        room_id: str,
+-        client_snapshot: list[tuple[int, float, dict[str, Any] | None, bytes]],
+-    ) -> None:
+-        """Broadcast a specific room's state from a snapshot."""
+-        message_bytes = self._serialize_room_transform(room_id, client_snapshot)
+-        if not message_bytes:
+-            return
+-
+-        topic_bytes = room_id.encode("utf-8")
+-        self._enqueue_pub_latest(topic_bytes, message_bytes)
+-
+-    def _serialize_room_transform(
+-        self,
+-        room_id: str,
+-        client_snapshot: list[tuple[int, float, dict[str, Any] | None, bytes]],
+-    ) -> bytes | None:
+-        if not client_snapshot:
+-            return None
+-
+-        buffer = bytearray()
+-        buffer.append(binary_serializer.MSG_ROOM_POSE)
+-        buffer.append(binary_serializer.PROTOCOL_VERSION)
+-        binary_serializer._pack_string(buffer, room_id)
+-        buffer.extend(struct.pack("<d", time.monotonic()))
+-        count_offset = len(buffer)
+-        buffer.extend(b"\x00\x00")
+-
+-        count = 0
+-        for client_no, pose_time, transform_data, body_bytes in client_snapshot:
+-            if body_bytes:
+-                buffer.extend(struct.pack("<H", client_no))
+-                buffer.extend(struct.pack("<d", pose_time))
+-                buffer.extend(body_bytes)
+-                count += 1
+-                continue
+-
+-            if transform_data:
+-                transform_data["poseTime"] = pose_time
+-                binary_serializer._serialize_client_data_short(buffer, transform_data)
+-                count += 1
+-
+-        if count == 0:
+-            return None
++    def _broadcast_room(self, room_id, clients):
++        """Broadcast a specific room's state"""
++        # Filter out stealth clients from broadcasts
++        client_transforms = [
++            client["transform_data"]
++            for client in clients.values()
++            if client["transform_data"] and not client.get("is_stealth", False)
++        ]
++
++        if client_transforms:
++            room_transform = {
++                "roomId": room_id,
++                "clients": client_transforms,
++            }
+ 
+-        struct.pack_into("<H", buffer, count_offset, count)
+-        return bytes(buffer)
++            # Send binary format with client numbers
++            topic_bytes = room_id.encode("utf-8")
++            message_bytes = binary_serializer.serialize_room_transform(room_transform)
++            # Transform is overwrite-only => keep only the latest per room/topic
++            self._enqueue_pub_latest(topic_bytes, message_bytes)
+ 
+-    def _cleanup_clients(self, current_time: float) -> None:
++    def _cleanup_clients(self, current_time):
+         """Clean up disconnected clients with atomic operations to prevent memory leaks"""
+         timeout = self.CLIENT_TIMEOUT
++        if timeout is None or timeout <= 0:
++            return
+ 
+         with self._rooms_lock:
+             rooms_to_remove = []
+@@ -1837,46 +1308,31 @@ class NetSyncServer:
+                 # Remove timed out clients in batch
+                 if clients_to_remove:
+                     for device_id in clients_to_remove:
+-                        client_no = clients[device_id].get("client_no")
++                        removed_client = clients[device_id]
++                        client_no = removed_client.get("client_no")
+                         del clients[device_id]
+                         # Clean up binary cache by client number
+-                        if client_no and client_no in self.client_transform_body_cache:
+-                            del self.client_transform_body_cache[client_no]
++                        if client_no and client_no in self.client_binary_cache:
++                            del self.client_binary_cache[client_no]
+                         # Note: We don't remove device ID->clientNo mapping here
+                         # It will be cleaned up after DEVICE_ID_EXPIRY_TIME
++                        elapsed = current_time - removed_client["last_update"]
+                         logger.info(
+-                            f"Client {device_id[:8]}... (client number: {client_no}) removed (timeout)"
++                            f"Client {device_id[:8]}... (client number: {client_no}) removed "
++                            f"(timeout, last_update={elapsed:.2f}s ago)"
+                         )
+ 
+                     # Mark room as dirty since clients were removed
+                     self.room_dirty_flags[room_id] = True
+ 
+-                    # Mark room for debounced ID mapping broadcast
+-                    self.room_id_mapping_dirty[room_id] = True
++                    # Broadcast updated ID mappings after client removal
++                    self._broadcast_id_mappings(room_id)
+ 
+-                # Handle empty room tracking with delayed removal
++                # Mark empty rooms for removal
+                 if not clients:
+-                    # Room is empty - track when it became empty
+-                    if room_id not in self.room_empty_since:
+-                        # Just became empty - start tracking
+-                        self.room_empty_since[room_id] = current_time
+-                        logger.info(
+-                            f"Room {room_id} became empty, "
+-                            f"will expire in {self.EMPTY_ROOM_EXPIRY_TIME}s"
+-                        )
+-                    elif (
+-                        current_time - self.room_empty_since[room_id]
+-                        > self.EMPTY_ROOM_EXPIRY_TIME
+-                    ):
+-                        # Been empty long enough - mark for removal
+-                        rooms_to_remove.append(room_id)
+-                else:
+-                    # Room has clients - clear empty tracking if exists
+-                    if room_id in self.room_empty_since:
+-                        del self.room_empty_since[room_id]
+-                        logger.info(f"Room {room_id} is no longer empty")
++                    rooms_to_remove.append(room_id)
+ 
+-            # Remove rooms that have been empty for longer than EMPTY_ROOM_EXPIRY_TIME
++            # Remove empty rooms and clean up ALL tracking data
+             for room_id in rooms_to_remove:
+                 try:
+                     # Delete from all room-related data structures
+@@ -1893,16 +1349,6 @@ class NetSyncServer:
+                     if room_id in self.room_client_no_to_device_id:
+                         del self.room_client_no_to_device_id[room_id]
+ 
+-                    # Clean up ID mapping debounce tracking
+-                    if room_id in self.room_id_mapping_dirty:
+-                        del self.room_id_mapping_dirty[room_id]
+-                    if room_id in self.room_last_id_mapping_broadcast:
+-                        del self.room_last_id_mapping_broadcast[room_id]
+-
+-                    # Clean up empty room tracking
+-                    if room_id in self.room_empty_since:
+-                        del self.room_empty_since[room_id]
+-
+                     # Clean up NV-related structures
+                     if room_id in self.global_variables:
+                         del self.global_variables[room_id]
+@@ -1923,7 +1369,7 @@ class NetSyncServer:
+                     logger.error(f"Error during room cleanup for {room_id}: {e}")
+                     # Continue with other rooms even if one fails
+ 
+-    def _start_server_discovery(self) -> None:
++    def _start_server_discovery(self):
+         """Start server discovery service to respond to client requests"""
+         # Start UDP server discovery
+         try:
+@@ -1953,19 +1399,17 @@ class NetSyncServer:
+         # Start TCP server discovery
+         self._start_tcp_server_discovery()
+ 
+-    def _stop_server_discovery(self) -> None:
++    def _stop_server_discovery(self):
+         """Stop server discovery service"""
+         # Stop UDP server discovery
+         self.server_discovery_running = False
+ 
+-        udp_socket = self.server_discovery_socket
+-        if udp_socket is not None:
+-            udp_socket.close()
++        if self.server_discovery_socket:
++            self.server_discovery_socket.close()
+             self.server_discovery_socket = None
+ 
+-        udp_thread = self.server_discovery_thread
+-        if udp_thread is not None:
+-            udp_thread.join(timeout=2)
++        if self.server_discovery_thread:
++            self.server_discovery_thread.join(timeout=2)
+             self.server_discovery_thread = None
+ 
+         # Stop TCP server discovery
+@@ -1973,27 +1417,24 @@ class NetSyncServer:
+ 
+         logger.info("Stopped discovery service")
+ 
+-    def _server_discovery_loop(self) -> None:
++    def _server_discovery_loop(self):
+         """UDP discovery service loop - responds to client discovery requests"""
+         # Response message format: STYLY-NETSYNC|dealerPort|pubPort|serverName
+         response = (
+             f"STYLY-NETSYNC|{self.dealer_port}|{self.pub_port}|{self.server_name}"
+         )
+         response_bytes = response.encode("utf-8")
+-        udp_socket = self.server_discovery_socket
+-        if udp_socket is None:
+-            return
+ 
+         while self.server_discovery_running:
+             try:
+                 # Wait for client discovery request
+-                data, client_addr = udp_socket.recvfrom(1024)
++                data, client_addr = self.server_discovery_socket.recvfrom(1024)
+                 request = data.decode("utf-8")
+ 
+                 # Validate request format
+                 if request == "STYLY-NETSYNC-DISCOVER":
+                     # Send response back to requesting client
+-                    udp_socket.sendto(response_bytes, client_addr)
++                    self.server_discovery_socket.sendto(response_bytes, client_addr)
+                     logger.debug(
+                         f"Responded to UDP discovery request from {client_addr}"
+                     )
+@@ -2007,7 +1448,7 @@ class NetSyncServer:
+                 ):  # Only log if we're still supposed to be running
+                     logger.error(f"UDP discovery service error: {e}")
+ 
+-    def _start_tcp_server_discovery(self) -> None:
++    def _start_tcp_server_discovery(self):
+         """Start TCP-based server discovery service"""
+         try:
+             self.tcp_server_discovery_socket = socket.socket(
+@@ -2034,35 +1475,30 @@ class NetSyncServer:
+             logger.error(f"Failed to start TCP discovery service: {e}")
+             self.tcp_server_discovery_running = False
+ 
+-    def _stop_tcp_server_discovery(self) -> None:
++    def _stop_tcp_server_discovery(self):
+         """Stop TCP-based server discovery service"""
+         self.tcp_server_discovery_running = False
+ 
+-        tcp_socket = self.tcp_server_discovery_socket
+-        if tcp_socket is not None:
+-            tcp_socket.close()
++        if self.tcp_server_discovery_socket:
++            self.tcp_server_discovery_socket.close()
+             self.tcp_server_discovery_socket = None
+ 
+-        tcp_thread = self.tcp_server_discovery_thread
+-        if tcp_thread is not None:
+-            tcp_thread.join(timeout=2)
++        if self.tcp_server_discovery_thread:
++            self.tcp_server_discovery_thread.join(timeout=2)
+             self.tcp_server_discovery_thread = None
+ 
+-    def _tcp_server_discovery_loop(self) -> None:
++    def _tcp_server_discovery_loop(self):
+         """TCP discovery service loop - responds to client discovery requests"""
+         # Response message format: STYLY-NETSYNC|dealerPort|pubPort|serverName\n
+         response = (
+             f"STYLY-NETSYNC|{self.dealer_port}|{self.pub_port}|{self.server_name}\n"
+         )
+         response_bytes = response.encode("utf-8")
+-        tcp_socket = self.tcp_server_discovery_socket
+-        if tcp_socket is None:
+-            return
+ 
+         while self.tcp_server_discovery_running:
+             try:
+                 # Accept incoming connection
+-                client_socket, client_addr = tcp_socket.accept()
++                client_socket, client_addr = self.tcp_server_discovery_socket.accept()
+                 client_socket.settimeout(2.0)  # Timeout for client operations
+ 
+                 try:
+@@ -2093,7 +1529,7 @@ class NetSyncServer:
+                     logger.error(f"TCP discovery service error: {e}")
+ 
+ 
+-def display_logo() -> None:
++def display_logo():
+     logo = """
+ CgobWzM4OzU7MjE2bSDilojilojilojilojilojilojilojilZcg4paI4paIG1szODs1OzIxMG3ilojilojilojilojilojilojilZcg4paI4paI4pWXICAg4paI4paI4pWXIOKWiOKWiOKVlyAgICAbWzM4OzU7MjE2bSAg4paI4paI4pWXICAg4paI4paI4pWXG1szOW0KG1szODs1OzIxNm0g4paI4paI4pWU4pWQ4pWQ4pWQ4pWQ4pWdIOKVmuKVkBtbMzg7NTsyMTBt4pWQ4paI4paI4pWU4pWQ4pWQ4pWdIOKVmuKWiOKWiOKVlyDilojilojilZTilZ0g4paI4paI4pWRICAgIBtbMzg7NTsyMTZtICDilZrilojilojilZcg4paI4paI4pWU4pWdG1szOW0KG1szODs1OzIxNm0g4paI4paI4paI4paI4paI4paI4paI4pWXICAgG1szODs1OzIxMG0g4paI4paI4pWRICAgICDilZrilojilojilojilojilZTilZ0gIOKWiOKWiOKVkSAgICAbWzM4OzU7MjE2bSAgIOKVmuKWiOKWiOKWiOKWiOKVlOKVnSAbWzM5bQobWzM4OzU7MjE2bSDilZrilZDilZDilZDilZDilojilojilZEgICAbWzM4OzU7MjEwbSDilojilojilZEgICAgICDilZrilojilojilZTilZ0gICDilojilojilZEgICAgG1szODs1OzIxNm0gICAg4pWa4paI4paI4pWU4pWdICAbWzM5bQobWzM4OzU7MjE2bSDilojilojilojilojilojilojilojilZEgICAbWzM4OzU7MjEwbSDilojilojilZEgICAgICAg4paI4paI4pWRICAgIOKWiOKWiOKWiOKWiOKWiOKWiOKWiBtbMzg7NTsyMTZt4pWXICAgIOKWiOKWiOKVkSAgIBtbMzltChtbMzg7NTsyMTZtIOKVmuKVkOKVkOKVkOKVkOKVkOKVkOKVnSAgIBtbMzg7NTsyMTBtIOKVmuKVkOKVnSAgICAgICDilZrilZDilZ0gICAg4pWa4pWQ4pWQ4pWQ4pWQ4pWQ4pWQG1szODs1OzIxNm3ilZ0gICAg4pWa4pWQ4pWdICAgG1szOW0KChtbMzg7NTsyMTZtIOKWiOKWiOKWiOKVlyAgIOKWiOKWiOKVlyDilojilojilojilojilojilogbWzM4OzU7MjEwbeKWiOKVlyDilojilojilojilojilojilojilojilojilZcg4paI4paI4paI4paI4paI4paI4paI4pWXIOKWiOKWiOKVlyAgIOKWiOKWiOKVlyDilojilojilojilZcbWzM4OzU7MjE2bSAgIOKWiOKWiOKVlyAg4paI4paI4paI4paI4paI4paI4pWXG1szOW0KG1szODs1OzIxNm0g4paI4paI4paI4paI4pWXICDilojilojilZEg4paI4paI4pWU4pWQ4pWQ4pWQG1szODs1OzIxMG3ilZDilZ0g4pWa4pWQ4pWQ4paI4paI4pWU4pWQ4pWQ4pWdIOKWiOKWiOKVlOKVkOKVkOKVkOKVkOKVnSDilZrilojilojilZcg4paI4paI4pWU4pWdIOKWiOKWiOKWiOKWiBtbMzg7NTsyMTZt4pWXICDilojilojilZEg4paI4paI4pWU4pWQ4pWQ4pWQ4pWQ4pWdG1szOW0KG1szODs1OzIxNm0g4paI4paI4pWU4paI4paI4pWXIOKWiOKWiOKVkSDilojilojilojilojilojilZcbWzM4OzU7MjEwbSAgICAgIOKWiOKWiOKVkSAgICDilojilojilojilojilojilojilojilZcgIOKVmuKWiOKWiOKWiOKWiOKVlOKVnSAg4paI4paI4pWU4paIG1szODs1OzIxNm3ilojilZcg4paI4paI4pWRIOKWiOKWiOKVkSAgICAgG1szOW0KG1szODs1OzIxNm0g4paI4paI4pWR4pWa4paI4paI4pWX4paI4paI4pWRIOKWiOKWiOKVlOKVkOKVkOKVnRtbMzg7NTsyMTBtICAgICAg4paI4paI4pWRICAgIOKVmuKVkOKVkOKVkOKVkOKWiOKWiOKVkSAgIOKVmuKWiOKWiOKVlOKVnSAgIOKWiOKWiOKVkeKVmhtbMzg7NTsyMTZt4paI4paI4pWX4paI4paI4pWRIOKWiOKWiOKVkSAgICAgG1szOW0KG1szODs1OzIxNm0g4paI4paI4pWRIOKVmuKWiOKWiOKWiOKWiOKVkSDilojilojilojilojilojilogbWzM4OzU7MjEwbeKWiOKVlyAgICDilojilojilZEgICAg4paI4paI4paI4paI4paI4paI4paI4pWRICAgIOKWiOKWiOKVkSAgICDilojilojilZEgG1szODs1OzIxNm3ilZrilojilojilojilojilZEg4pWa4paI4paI4paI4paI4paI4paI4pWXG1szOW0KG1szODs1OzIxNm0g4pWa4pWQ4pWdICDilZrilZDilZDilZDilZ0g4pWa4pWQ4pWQ4pWQ4pWQ4pWQG1szODs1OzIxMG3ilZDilZ0gICAg4pWa4pWQ4pWdICAgIOKVmuKVkOKVkOKVkOKVkOKVkOKVkOKVnSAgICDilZrilZDilZ0gICAg4pWa4pWQ4pWdIBtbMzg7NTsyMTZtIOKVmuKVkOKVkOKVkOKVnSAg4pWa4pWQ4pWQ4pWQ4pWQ4pWQ4pWdG1szOW0KCgo=
+ """.strip()
+@@ -2101,14 +1537,8 @@ CgobWzM4OzU7MjE2bSDilojilojilojilojilojilojilojilZcg4paI4paIG1szODs1OzIxMG3iloji
+     sys.stdout.flush()
+ 
+ 
+-def main() -> None:
++def main():
+     parser = argparse.ArgumentParser(description="STYLY NetSync Server")
+-    parser.add_argument(
+-        "--config",
+-        type=Path,
+-        metavar="FILE",
+-        help="Path to user TOML configuration file (overrides defaults)",
+-    )
+     parser.add_argument(
+         "--no-server-discovery", action="store_true", help="Disable server discovery"
+     )
+@@ -2116,7 +1546,7 @@ def main() -> None:
+         "--server-discovery-port",
+         type=valid_port,
+         metavar="PORT",
+-        help="UDP port used for server discovery (see default.toml for default)",
++        help=f"UDP port used for server discovery (default: {DEFAULT_SERVER_DISCOVERY_PORT})",
+     )
+     parser.add_argument(
+         "-V",
+@@ -2153,56 +1583,25 @@ def main() -> None:
+     )
+     parser.add_argument(
+         "--log-level-console",
+-        default=None,
++        default="INFO",
+         help="Console log level (default: INFO)",
+     )
+ 
+     args = parser.parse_args()
+ 
+-    # Load configuration from file and/or CLI args
+-    # Note: Logging is configured after this to use config values
+-    try:
+-        config, config_overrides = create_config_from_args(args)
+-    except DefaultConfigError as e:
+-        # Fatal error: default.toml cannot be loaded
+-        print(f"FATAL: {e}")
+-        sys.exit(1)
+-    except FileNotFoundError:
+-        # User config file not found
+-        print(f"ERROR: User configuration file not found: {args.config}")
+-        sys.exit(1)
+-    except ConfigurationError as e:
+-        # Validation errors - print each error clearly
+-        print("ERROR: Configuration validation failed:")
+-        for error in e.errors:
+-            print(f"  - {error}")
+-        sys.exit(1)
+-    except Exception as e:
+-        print(f"ERROR: Failed to load configuration: {e}")
+-        sys.exit(1)
+-
+-    # Configure logging with merged settings (config file + CLI overrides)
+-    log_dir = Path(config.log_dir) if config.log_dir else None
+     configure_logging(
+-        log_dir=log_dir,
+-        console_level=config.log_level_console,
+-        console_json=config.log_json_console,
+-        rotation=config.log_rotation,
+-        retention=config.log_retention,
++        log_dir=args.log_dir,
++        console_level=args.log_level_console,
++        console_json=args.log_json_console,
++        rotation=args.log_rotation,
++        retention=args.log_retention,
+     )
+ 
+-    # Log config file info after logging is configured
+-    if args.config is not None:
+-        logger.info(f"Loaded user configuration from {args.config}")
+-        if config_overrides:
+-            logger.info("Configuration overrides from user config:")
+-            for override in config_overrides:
+-                logger.info(
+-                    f"  {override.key}: {override.default_value} -> {override.new_value}"
+-                )
+-
+-    # Apply global configuration settings
+-    binary_serializer.set_max_virtual_transforms(config.max_virtual_transforms)
++    # Set default values from module constants (previously from argparse)
++    dealer_port = DEFAULT_DEALER_PORT
++    pub_port = DEFAULT_PUB_PORT
++    server_discovery_port = DEFAULT_SERVER_DISCOVERY_PORT
++    server_name = DEFAULT_SERVER_NAME
+ 
+     logger.info("=" * 80)
+     logger.info("STYLY NetSync Server Starting")
+@@ -2218,26 +1617,27 @@ def main() -> None:
+     else:
+         logger.info("  Server IP addresses: Unable to detect")
+ 
+-    logger.info(f"  DEALER port: {config.dealer_port}")
+-    logger.info(f"  PUB port: {config.pub_port}")
+-    if config.enable_server_discovery:
+-        logger.info(f"  Server discovery port: {config.server_discovery_port}")
+-        logger.info(f"  Server name: {config.server_name}")
++    logger.info(f"  DEALER port: {dealer_port}")
++    logger.info(f"  PUB port: {pub_port}")
++    if not args.no_server_discovery:
++        if args.server_discovery_port is not None:
++            server_discovery_port = args.server_discovery_port
++        logger.info(f"  Server discovery port: {server_discovery_port}")
++        logger.info(f"  Server name: {server_name}")
+     else:
+         logger.info("  Discovery: Disabled")
+     logger.info("=" * 80)
+ 
+     server = NetSyncServer(
+-        dealer_port=config.dealer_port,
+-        pub_port=config.pub_port,
+-        enable_server_discovery=config.enable_server_discovery,
+-        server_discovery_port=config.server_discovery_port,
+-        server_name=config.server_name,
+-        config=config,
++        dealer_port=dealer_port,
++        pub_port=pub_port,
++        enable_server_discovery=not args.no_server_discovery,
++        server_discovery_port=server_discovery_port,
++        server_name=server_name,
+     )
+ 
+     try:
+-        server.start(ip_addresses=ip_addresses)
++        server.start()
+ 
+         logger.info("Server started successfully. Press Ctrl+C to stop.")
+ 
