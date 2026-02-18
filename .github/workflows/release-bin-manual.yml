@@ -1,0 +1,210 @@
+name: Release Bin Manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag name (e.g. 0.8.0 / bin-44565b6)
+        required: true
+        type: string
+      commit:
+        description: Commit SHA to build and release
+        required: true
+        type: string
+      prerelease:
+        description: Mark as prerelease
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-bin-manual-${{ inputs.tag }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      commit_sha: ${{ steps.meta.outputs.commit_sha }}
+      app_base_name: ${{ steps.meta.outputs.app_base_name }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+    steps:
+      - name: Validate inputs and set metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COMMIT_SHA="$(echo "${{ inputs.commit }}" | xargs)"
+          TAG_NAME="$(echo "${{ inputs.tag }}" | xargs)"
+
+          [[ "$COMMIT_SHA" =~ ^[0-9a-fA-F]{7,40}$ ]] || { echo "Invalid commit SHA: $COMMIT_SHA"; exit 1; }
+          [[ -n "$TAG_NAME" ]] || { echo "Tag input must not be empty."; exit 1; }
+
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          APP_BASE_NAME="styly-netsync-server-${SHORT_SHA}"
+          RELEASE_NAME="NetSync Server ${SHORT_SHA}"
+
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "app_base_name=$APP_BASE_NAME" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
+
+  build-windows:
+    needs: prepare
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: STYLY-NetSync-Server
+    env:
+      COMMIT_SHA: ${{ needs.prepare.outputs.commit_sha }}
+      APP_BASE: ${{ needs.prepare.outputs.app_base_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COMMIT_SHA }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Build (Windows)
+        run: |
+          cat > build_entrypoint.py << 'PY'
+          from multiprocessing import freeze_support
+          from styly_netsync.cli import cli_main
+          if __name__ == "__main__":
+              freeze_support()
+              cli_main()
+          PY
+
+          python -m PyInstaller \
+            --noconfirm \
+            --onefile \
+            --console \
+            --name "${APP_BASE}-windows" \
+            --paths src \
+            --distpath dist \
+            --workpath build \
+            --specpath build \
+            --collect-data styly_netsync \
+            --collect-binaries zmq \
+            --collect-submodules uvicorn \
+            --collect-submodules fastapi \
+            --collect-submodules starlette \
+            --collect-submodules pydantic \
+            --collect-submodules anyio \
+            --collect-submodules zmq.backend \
+            build_entrypoint.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: releasebin-windows
+          path: STYLY-NetSync-Server/dist/${{ env.APP_BASE }}-windows.exe
+
+  build-macos:
+    needs: prepare
+    runs-on: macos-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: STYLY-NetSync-Server
+    env:
+      COMMIT_SHA: ${{ needs.prepare.outputs.commit_sha }}
+      APP_BASE: ${{ needs.prepare.outputs.app_base_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COMMIT_SHA }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Build (macOS)
+        run: |
+          cat > build_entrypoint.py << 'PY'
+          from multiprocessing import freeze_support
+          from styly_netsync.cli import cli_main
+          if __name__ == "__main__":
+              freeze_support()
+              cli_main()
+          PY
+
+          python -m PyInstaller \
+            --noconfirm \
+            --onefile \
+            --console \
+            --name "${APP_BASE}-macos" \
+            --paths src \
+            --distpath dist \
+            --workpath build \
+            --specpath build \
+            --collect-data styly_netsync \
+            --collect-binaries zmq \
+            --collect-submodules uvicorn \
+            --collect-submodules fastapi \
+            --collect-submodules starlette \
+            --collect-submodules pydantic \
+            --collect-submodules anyio \
+            --collect-submodules zmq.backend \
+            build_entrypoint.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: releasebin-macos
+          path: STYLY-NetSync-Server/dist/${{ env.APP_BASE }}-macos
+
+  publish-release:
+    needs: [prepare, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Ensure RELEASE_TOKEN is configured
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${{ secrets.RELEASE_TOKEN }}" ]] || { echo "Missing secrets.RELEASE_TOKEN"; exit 1; }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: releasebin-windows
+          path: release-assets/releasebin-windows
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: releasebin-macos
+          path: release-assets/releasebin-macos
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.RELEASE_TOKEN }}
+          repository: ${{ github.repository }}
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          target_commitish: ${{ needs.prepare.outputs.commit_sha }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          prerelease: ${{ inputs.prerelease }}
+          draft: false
+          overwrite_files: true
+          files: |
+            release-assets/releasebin-windows/*
+            release-assets/releasebin-macos/*
