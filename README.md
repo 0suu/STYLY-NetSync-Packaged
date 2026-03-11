@@ -64,7 +64,7 @@ npm install -g openupm-cli
 cd YOUR_UNITY_PROJECT_DIR
 
 # Add/Update NetSync package with specific version
-openupm add -f com.styly.styly-netsync@0.9.1
+openupm add -f com.styly.styly-netsync@0.10.1
 ```
 
 ## Setup
@@ -75,10 +75,10 @@ openupm add -f com.styly.styly-netsync@0.9.1
 ```shell
 # Start NetSync server
 # Use the same version of the Unity package
-uvx styly-netsync-server@0.9.1
+uvx styly-netsync-server@0.10.1
 
 # [Optional] Start client simulator
-uvx --from styly-netsync-server@0.9.1 styly-netsync-simulator --clients 10
+uvx --from styly-netsync-server@0.10.1 styly-netsync-simulator --clients 10
 ```
 The uvx command automatically downloads the package, creates an isolated virtual environment, installs dependencies, and runs the python server program.
 
@@ -166,10 +166,17 @@ using Styly.NetSync;
 
 ### RPC
 All RPC arguments are strings for simplicity.
+RPCs can be broadcast to all clients or sent to specific clients by client number.
 
 ```csharp
 // Broadcast to all clients in the room
 NetSyncManager.Instance.Rpc("FunctionName", new string[] { "arg1", "arg2" });
+
+// Send to a single client by client number
+NetSyncManager.Instance.Rpc("FunctionName", new string[] { "arg1", "arg2" }, targetClientNo);
+
+// Send to multiple clients by their client numbers
+NetSyncManager.Instance.Rpc("FunctionName", new string[] { "arg1", "arg2" }, new int[] { 1, 3, 7 });
 
 // Receive RPCs
 NetSyncManager.Instance.OnRPCReceived.AddListener((senderClientNo, functionName, args) =>
@@ -215,10 +222,10 @@ NetSyncManager.Instance.OnClientVariableChanged.AddListener((clientNo, name, old
 
 ### Testing with a Specific Branch
 
-Unity: Install package with git URL.  
+Unity: Install package with git URL.
 `https://github.com/styly-dev/STYLY-NetSync.git?path=STYLY-NetSync-Unity/Packages/com.styly.styly-netsync#develop`
 
-Server:  
+Server:
 `uvx --from "git+https://github.com/styly-dev/STYLY-NetSync@develop#subdirectory=STYLY-NetSync-Server" styly-netsync-server`
 
 ### Release Workflow
