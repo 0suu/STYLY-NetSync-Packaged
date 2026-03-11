@@ -46,8 +46,8 @@ jobs:
           [[ -n "$TAG_NAME" ]] || { echo "Tag input must not be empty."; exit 1; }
 
           SHORT_SHA="${COMMIT_SHA:0:7}"
-          APP_BASE_NAME="styly-netsync-server-${SHORT_SHA}"
-          RELEASE_NAME="NetSync Server ${SHORT_SHA}"
+          APP_BASE_NAME="styly-netsync-server-${TAG_NAME}"
+          RELEASE_NAME="NetSync Server ${TAG_NAME}"
 
           echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
           echo "app_base_name=$APP_BASE_NAME" >> "$GITHUB_OUTPUT"
