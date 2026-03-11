@@ -194,6 +194,9 @@ jobs:
           name: releasebin-macos
           path: release-assets/releasebin-macos
 
+      - name: Restore execute permission for macOS binary
+        run: chmod +x release-assets/releasebin-macos/*
+
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
