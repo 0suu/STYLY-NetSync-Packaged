@@ -167,10 +167,13 @@ jobs:
             --collect-submodules zmq.backend \
             build_entrypoint.py
 
+      - name: Package macOS binary as tar.gz (preserves execute permission)
+        run: tar -czf "dist/${APP_BASE}-macos.tar.gz" -C dist "${APP_BASE}-macos"
+
       - uses: actions/upload-artifact@v4
         with:
           name: releasebin-macos
-          path: STYLY-NetSync-Server/dist/${{ env.APP_BASE }}-macos
+          path: STYLY-NetSync-Server/dist/${{ env.APP_BASE }}-macos.tar.gz
 
   publish-release:
     needs: [prepare, build-windows, build-macos]
@@ -193,9 +196,6 @@ jobs:
         with:
           name: releasebin-macos
           path: release-assets/releasebin-macos
-
-      - name: Restore execute permission for macOS binary
-        run: chmod +x release-assets/releasebin-macos/*
 
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v2
