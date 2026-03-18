@@ -1183,6 +1183,7 @@ class NetSyncServer:
 
             # Update or create client (using device ID as key for backward compatibility)
             is_new_client = device_id not in self.rooms[room_id]
+            is_reconnect = False
             if is_new_client:
                 self.rooms[room_id][device_id] = {
                     "identity": client_identity,
@@ -1199,7 +1200,16 @@ class NetSyncServer:
                     f"New client {device_id[:8]}... (client number: {client_no}){stealth_text} joined room {room_id}"
                 )
             else:
-                # Update existing client and mark room as dirty
+                # Update existing client and mark room as dirty.
+                # Detect reconnection: when a client reconnects (e.g. after
+                # sleep/wake) before the timeout removes it from rooms, the
+                # DEALER socket is recreated with a new ZMQ identity.  Without
+                # updating the identity the server would send ROUTER control
+                # messages (RPC, NV sync) to the stale identity, silently
+                # losing them.
+                old_identity = self.rooms[room_id][device_id].get("identity")
+                is_reconnect = old_identity != client_identity
+                self.rooms[room_id][device_id]["identity"] = client_identity
                 self.rooms[room_id][device_id]["transform_data"] = data_with_client_no
                 self.rooms[room_id][device_id]["last_update"] = time.monotonic()
                 self.rooms[room_id][device_id]["client_no"] = client_no
@@ -1211,13 +1221,25 @@ class NetSyncServer:
                 # Mark room as dirty since transform data has arrived
                 self.room_dirty_flags[room_id] = True
 
+                if is_reconnect:
+                    # Re-broadcast ID mapping so the reconnected client gets
+                    # the current device-to-clientNo table.
+                    self.room_id_mapping_dirty[room_id] = True
+                    logger.info(
+                        f"Client {device_id[:8]}... reconnected with new identity in room {room_id}"
+                    )
+
             # Mark room for debounced ID mapping broadcast when a new client joins
             if is_new_client:
                 self.room_id_mapping_dirty[room_id] = True
 
-        # Sync network variables to new client (outside lock to avoid deadlocks)
+        # Sync network variables outside lock to avoid deadlocks.
         if is_new_client:
             self._sync_network_variables_to_new_client(room_id)
+        elif is_reconnect:
+            # Unicast NV state only to the reconnecting client — no need to
+            # broadcast to the entire room.
+            self._sync_network_variables_to_client(room_id, client_identity)
 
     def _extract_transform_body(self, raw_payload: bytes) -> bytes:
         """Extract the transform body without device ID from raw payload."""
@@ -1450,19 +1472,46 @@ class NetSyncServer:
             # Broadcast sync to all clients
             self._broadcast_client_var_sync(room_id)
 
-    def _broadcast_global_var_sync(self, room_id: str) -> None:
-        """Broadcast global variables sync to all clients in room via ROUTER unicast.
+    def _build_global_var_sync_payload(self, room_id: str) -> bytes | None:
+        """Build a serialized global-variable sync payload for the given room.
 
-        Network Variable syncs are sent via ROUTER for reliable delivery to each client,
-        rather than via PUB which can drop messages under load.
+        Returns None when there are no global variables to sync.
+        Caller must hold ``_rooms_lock`` (or accept that global_variables may
+        be mutated concurrently — the current callers all hold the lock).
         """
-        with self._rooms_lock:
-            if room_id not in self.global_variables:
-                return
+        if room_id not in self.global_variables:
+            return None
 
-            variables = []
-            for var_name, var_data in self.global_variables[room_id].items():
-                variables.append(
+        variables = []
+        for var_name, var_data in self.global_variables[room_id].items():
+            variables.append(
+                {
+                    "name": var_name,
+                    "value": var_data["value"],
+                    "timestamp": var_data["timestamp"],
+                    "lastWriterClientNo": var_data["lastWriterClientNo"],
+                }
+            )
+
+        if not variables:
+            return None
+
+        return binary_serializer.serialize_global_var_sync({"variables": variables})
+
+    def _build_client_var_sync_payload(self, room_id: str) -> bytes | None:
+        """Build a serialized client-variable sync payload for the given room.
+
+        Returns None when there are no client variables to sync.
+        Caller must hold ``_rooms_lock``.
+        """
+        if room_id not in self.client_variables:
+            return None
+
+        client_variables: dict[str, list[dict[str, object]]] = {}
+        for client_no, variables in self.client_variables[room_id].items():
+            client_vars: list[dict[str, object]] = []
+            for var_name, var_data in variables.items():
+                client_vars.append(
                     {
                         "name": var_name,
                         "value": var_data["value"],
@@ -1470,17 +1519,28 @@ class NetSyncServer:
                         "lastWriterClientNo": var_data["lastWriterClientNo"],
                     }
                 )
+            if client_vars:
+                client_variables[str(client_no)] = client_vars
 
-            if variables:
-                message_bytes = binary_serializer.serialize_global_var_sync(
-                    {"variables": variables}
-                )
-                # Send via ROUTER unicast (lock is held, but _send_ctrl_to_room_via_router
-                # will acquire the lock again - RLock allows this)
-                self._send_ctrl_to_room_via_router(room_id, message_bytes)
-                logger.debug(
-                    f"Broadcasted {len(variables)} global variables to room {room_id}"
-                )
+        if not client_variables:
+            return None
+
+        return binary_serializer.serialize_client_var_sync(
+            {"clientVariables": client_variables}
+        )
+
+    def _broadcast_global_var_sync(self, room_id: str) -> None:
+        """Broadcast global variables sync to all clients in room via ROUTER unicast.
+
+        Network Variable syncs are sent via ROUTER for reliable delivery to each client,
+        rather than via PUB which can drop messages under load.
+        """
+        with self._rooms_lock:
+            message_bytes = self._build_global_var_sync_payload(room_id)
+
+        if message_bytes is not None:
+            self._send_ctrl_to_room_via_router(room_id, message_bytes)
+            logger.debug(f"Broadcasted global variables to room {room_id}")
 
     def _broadcast_client_var_sync(self, room_id: str) -> None:
         """Broadcast client variables sync to all clients in room via ROUTER unicast.
@@ -1489,39 +1549,35 @@ class NetSyncServer:
         rather than via PUB which can drop messages under load.
         """
         with self._rooms_lock:
-            if room_id not in self.client_variables:
-                return
+            message_bytes = self._build_client_var_sync_payload(room_id)
 
-            client_variables = {}
-            for client_no, variables in self.client_variables[room_id].items():
-                client_vars = []
-                for var_name, var_data in variables.items():
-                    client_vars.append(
-                        {
-                            "name": var_name,
-                            "value": var_data["value"],
-                            "timestamp": var_data["timestamp"],
-                            "lastWriterClientNo": var_data["lastWriterClientNo"],
-                        }
-                    )
-                if client_vars:
-                    client_variables[str(client_no)] = client_vars
-
-            if client_variables:
-                message_bytes = binary_serializer.serialize_client_var_sync(
-                    {"clientVariables": client_variables}
-                )
-                # Send via ROUTER unicast (lock is held, but _send_ctrl_to_room_via_router
-                # will acquire the lock again - RLock allows this)
-                self._send_ctrl_to_room_via_router(room_id, message_bytes)
-                logger.debug(
-                    f"Broadcasted client variables for {len(client_variables)} clients to room {room_id}"
-                )
+        if message_bytes is not None:
+            self._send_ctrl_to_room_via_router(room_id, message_bytes)
+            logger.debug(f"Broadcasted client variables to room {room_id}")
 
     def _sync_network_variables_to_new_client(self, room_id: str) -> None:
-        """Send current Network Variables state to a newly connected client"""
+        """Send current Network Variables state to a newly connected client.
+
+        Broadcasts to all clients in the room (suitable for new-client joins
+        where the full room needs the updated mapping anyway).
+        """
         self._broadcast_global_var_sync(room_id)
         self._broadcast_client_var_sync(room_id)
+
+    def _sync_network_variables_to_client(self, room_id: str, identity: bytes) -> None:
+        """Unicast current Network Variables state to a single client.
+
+        Used on reconnect so that only the reconnecting client receives the
+        full NV snapshot, avoiding unnecessary traffic to other clients.
+        """
+        with self._rooms_lock:
+            global_payload = self._build_global_var_sync_payload(room_id)
+            client_payload = self._build_client_var_sync_payload(room_id)
+
+        if global_payload is not None:
+            self._enqueue_router(identity, room_id, global_payload)
+        if client_payload is not None:
+            self._enqueue_router(identity, room_id, client_payload)
 
     def _flush_nv_drain(self, room_id: str) -> None:
         """Drain all pending NV updates for a room in one go."""
