@@ -77,7 +77,7 @@ To customize settings:
 
 1. Get the default config file:
    - From local clone: `cp src/styly_netsync/default.toml my-config.toml`
-   - Or download from GitHub: [default.toml](https://github.com/psychic-vr-lab/STYLY-NetSync/blob/main/STYLY-NetSync-Server/src/styly_netsync/default.toml)
+   - Or download from GitHub: [default.toml](https://github.com/styly-dev/STYLY-NetSync/blob/develop/STYLY-NetSync-Server/src/styly_netsync/default.toml)
 
 2. Edit `my-config.toml` and keep only the settings you want to change (delete the rest)
 
@@ -112,7 +112,7 @@ Bridging: stdlib `logging` is routed to loguru automatically.
 
 ## REST bridge
 
-The server launches an embedded FastAPI application that exposes REST endpoints for managing Network Variables. Default port: `8800` (override with environment variable `NETSYNC_REST_PORT`).
+The server launches an embedded FastAPI application that exposes REST endpoints for managing Network Variables. Default port: `8800` (override with `--rest-api-port` CLI argument or `rest_api_port` in config file).
 
 ### Client variables
 

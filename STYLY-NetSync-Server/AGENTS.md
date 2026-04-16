@@ -1,37 +1,50 @@
-# Repository Guidelines
+# STYLY-NetSync Server
 
-## Project Structure & Module Organization
-- Unity client (Unity 6): `STYLY-NetSync-Unity`
-  Runtime: `Packages/com.styly.styly-netsync/Runtime/`; Editor: `Packages/com.styly.styly-netsync/Editor/`; Samples: `Assets/Samples_Dev/` (e.g., `Demo-01.unity`, `Debug Scene.unity`).
-- Python server (this repo): `STYLY-NetSync-Server`
-  Source: `src/styly_netsync/`; Tests: `tests/`; Config: `pyproject.toml`.
+## Repository Structure
 
-## Build, Test, and Development Commands
-- Python version: `python -V` (>=3.11).
-- Install (dev): `pip install -e .` or `uv pip install -e .`.
-- Lint/format: `ruff check .`; `black .`.
-- Type check: `mypy src`.
-- Test: `pytest -q` or `pytest --cov=src`.
-- Run server: `styly-netsync-server`.
-- Simulate clients: `styly-netsync-simulator --server localhost --room demo --clients 10`.
-- Additional simulator options: `--transform-send-rate`, `--spawn-batch-size`, `--spawn-batch-interval`, `--no-sync-battery`.
-- Unity: open `STYLY-NetSync-Unity` with Unity 6; use sample scenes for manual checks.
+- **Source**: `src/styly_netsync/`
+- **Tests**: `tests/` (unit + integration)
+- **Config**: `pyproject.toml`, `default.toml`
 
-## Coding Style & Naming Conventions
-- Python: 4 spaces; Black (line length 88), Ruff, MyPy (strict). Names — modules `snake_case`, classes `PascalCase`, functions `snake_case`.
-- C# (Unity): 4 spaces; public members/types `PascalCase`, fields/locals `camelCase`; use `[SerializeField] private` for serialized fields.
-- Unity rules: never use null-propagation with `UnityEngine.Object`; do not access Unity APIs from background threads; do not add `.meta` files manually.
+## Development Commands
 
-## Testing Guidelines
-- Python tests in `tests/` named `test_*.py`; keep deterministic and independent; prefer branch coverage. Run `pytest --cov=src`.
-- Unity verification: open `Assets/Samples_Dev/` scenes while the Python server is running.
+```bash
+# Setup
+pip install -e ".[dev]"
 
-## Commit & Pull Request Guidelines
-- Use Conventional Commits (e.g., `feat:`, `fix:`); keep subject ≤72 chars; reference issues.
-- Target PRs to `develop`; `main` updates via `.github/workflows/release-workflow.yml`.
-- Use GitHub CLI: `gh issue list`, `gh pr create`, `gh pr view`.
-- PR checklist: clear description, linked issues, test evidence (logs/screenshots or short capture for Unity), and changelog notes.
+# Run server
+styly-netsync-server
+styly-netsync-server --dealer-port 5555 --pub-port 5556 --server-discovery-port 9999
+styly-netsync-server --config my-config.toml
 
-## Security & Configuration Tips
-- Never commit secrets; prefer environment variables or Unity ProjectSettings; use local `.env` only for development.
+# Quality pipeline (run before committing)
+black src/ tests/ && ruff check src/ tests/ && mypy src/ && pytest --cov=src
 
+# Load testing
+styly-netsync-simulator --clients 100 --server localhost --room default_room
+```
+
+## Architecture
+
+- **NetSyncServer** (`server.py`): Multi-threaded (receive, periodic, discovery threads)
+- **BinarySerializer** (`binary_serializer.py`): Protocol v3 transform serializer
+- **Python Client API** (`client.py`): `net_sync_manager` class for Python clients
+- **REST Bridge** (`rest_bridge.py`): FastAPI REST API for external integrations
+
+## Configuration
+
+- `default.toml` contains all settings with defaults
+- Priority: CLI args > user config (`--config`) > default config
+- REST API: `--rest-api-port` (default: 8800)
+
+## Entry Points
+
+- `styly-netsync-server` — CLI via `cli.py`
+- `styly-netsync-simulator` — CLI via `client_simulator.py`
+- `python -m styly_netsync` — module execution
+
+## Development Standards
+
+- Python 3.11+ required; type hints required for all functions (MyPy strict)
+- Black (88 chars), Ruff, MyPy; `snake_case` modules/functions, `PascalCase` classes
+- Test files named `test_*.py`; keep deterministic and independent; prefer branch coverage

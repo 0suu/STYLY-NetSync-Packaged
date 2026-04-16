@@ -40,12 +40,13 @@ class TestLoadDefaultConfig:
         assert config.dealer_port == 5555
         assert config.pub_port == 5556
         assert config.server_discovery_port == 9999
+        assert config.rest_api_port == 8800
         assert config.server_name == "STYLY-NetSync-Server"
         assert config.enable_server_discovery is True
         # Timing
         assert config.idle_broadcast_interval == 2.0
         assert config.transform_broadcast_rate == 10
-        assert config.client_timeout == 2.5
+        assert config.client_timeout == 5
         assert config.cleanup_interval == 1.0
         assert config.device_id_expiry_time == 86400.0
         assert config.empty_room_expiry_time == 86400.0
@@ -87,6 +88,7 @@ class TestServerConfig:
             dealer_port=6666,
             pub_port=6667,
             server_discovery_port=8888,
+            rest_api_port=9900,
             server_name="Custom Server",
             enable_server_discovery=False,
             idle_broadcast_interval=default_config.idle_broadcast_interval,
@@ -117,6 +119,7 @@ class TestServerConfig:
         assert config.dealer_port == 6666
         assert config.pub_port == 6667
         assert config.server_discovery_port == 8888
+        assert config.rest_api_port == 9900
         assert config.server_name == "Custom Server"
         assert config.enable_server_discovery is False
 
@@ -528,12 +531,43 @@ class TestValidateConfig:
 class TestMergeCliArgs:
     """Tests for merge_cli_args function."""
 
+    def test_cli_overrides_dealer_port(self, default_config: ServerConfig) -> None:
+        """Test that CLI dealer_port overrides config."""
+        args = argparse.Namespace(
+            dealer_port=6000,
+            pub_port=None,
+            server_discovery_port=None,
+            no_server_discovery=False,
+        )
+
+        merged = merge_cli_args(default_config, args)
+        assert merged.dealer_port == 6000
+        # Original config unchanged
+        assert default_config.dealer_port == 5555
+
+    def test_cli_overrides_pub_port(self, default_config: ServerConfig) -> None:
+        """Test that CLI pub_port overrides config."""
+        args = argparse.Namespace(
+            dealer_port=None,
+            pub_port=6001,
+            server_discovery_port=None,
+            no_server_discovery=False,
+        )
+
+        merged = merge_cli_args(default_config, args)
+        assert merged.pub_port == 6001
+        # Original config unchanged
+        assert default_config.pub_port == 5556
+
     def test_cli_overrides_server_discovery_port(
         self, default_config: ServerConfig
     ) -> None:
         """Test that CLI server_discovery_port overrides config."""
         args = argparse.Namespace(
+            dealer_port=None,
+            pub_port=None,
             server_discovery_port=8888,
+            rest_api_port=None,
             no_server_discovery=False,
         )
 
@@ -541,6 +575,21 @@ class TestMergeCliArgs:
         assert merged.server_discovery_port == 8888
         # Original config unchanged
         assert default_config.server_discovery_port == 9999
+
+    def test_cli_overrides_rest_api_port(self, default_config: ServerConfig) -> None:
+        """Test that CLI rest_api_port overrides config."""
+        args = argparse.Namespace(
+            dealer_port=None,
+            pub_port=None,
+            server_discovery_port=None,
+            rest_api_port=9900,
+            no_server_discovery=False,
+        )
+
+        merged = merge_cli_args(default_config, args)
+        assert merged.rest_api_port == 9900
+        # Original config unchanged
+        assert default_config.rest_api_port == 8800
 
     def test_no_server_discovery_flag(self, default_config: ServerConfig) -> None:
         """Test that --no-server-discovery disables discovery."""
@@ -867,7 +916,7 @@ dealer_port = 7777
 dealer_port = 7777
 pub_port = 7778
 server_name = "Custom Server"
-client_timeout = 5.0
+client_timeout = 10.0
 """
         config_file = tmp_path / "user.toml"
         config_file.write_text(toml_content)

@@ -1,34 +1,90 @@
-# Repository Guidelines
+# STYLY-NetSync
 
-## Project Structure & Modules
-- **Unity client:** `STYLY-NetSync-Unity` (Unity 6). Core runtime under `Packages/com.styly.styly-netsync/Runtime/`; editor tools under `.../Editor/`; sample scenes in `Assets/Samples_Dev/` (e.g., `Demo-01.unity`, `Debug Scene.unity`); package samples in `Packages/com.styly.styly-netsync/Samples~/SimpleDemos/`.
-- **Python server:** `STYLY-NetSync-Server` with `src/styly_netsync/`, tests in `tests/`, config in `pyproject.toml`.
+## Repository Structure
 
-## Build, Test, and Dev Commands
-- Python env (local): `cd STYLY-NetSync-Server && python -V  # >=3.11`
-  - Install (dev): `pip install -e .`  or `uv pip install -e .`
-  - Lint/format: `ruff check .` · `black .`
-  - Type check: `mypy src`
-  - Test: `pytest -q` or `pytest --cov=src`
-  - Run server: `styly-netsync-server`
-  - Simulate clients: `styly-netsync-simulator --server localhost --room demo --clients 10`
-- Unity client: Open `STYLY-NetSync-Unity` with Unity 6. Use sample scenes under `Assets/Samples_Dev/` for manual verification.
+STYLY-NetSync is a Unity multiplayer framework for Location-Based Entertainment (LBE) VR/AR experiences.
 
-## Coding Style & Naming Conventions
-- Python: Black line length 88; Ruff enabled; MyPy with strict options (see `pyproject.toml`). Use 4-space indentation; name modules `snake_case`, classes `PascalCase`, functions `snake_case`.
-- C# (Unity): 4-space indentation; `PascalCase` for public members/types, `camelCase` for fields/locals; prefix serialized private fields with `[SerializeField]` and `private`.
-- Unity-specific rules: Do not use null-propagation (`?.` / `??`) with `UnityEngine.Object` types; use explicit null checks. Do not access Unity APIs from background threads. Do not add `.meta` files manually.
+- **STYLY-NetSync-Server/**: Python server using ZeroMQ for networking
+- **STYLY-NetSync-Unity/**: Unity package with client implementation
 
-## Testing Guidelines
-- Python: PyTest under `STYLY-NetSync-Server/tests/` (unit + integration). Use coverage with branch mode; keep tests deterministic and independent. Name files `test_*.py`.
-- Unity: No formal automated tests in this repo; verify via `Demo-01.unity` and `Debug Scene.unity` while the Python server is running.
+## XR-Specific Design Considerations
 
-## Commit & Pull Request Guidelines
-- Use Conventional Commits (e.g., `feat: ...`, `fix: ...`, `refactor: ...`). Keep subject ≤72 chars; reference issues (`gh issue view <id>`), and let PR titles mirror the intent.
-- Target PRs to `develop`. Manual PRs to `main` are blocked; use the release workflow: `.github/workflows/release-workflow.yml`.
-- PR checklist: clear description, linked issues, test evidence (logs/screenshots or short screen capture for Unity), and changelog-worthy notes.
+STYLY-NetSync is designed exclusively for XR (VR/MR/AR) applications:
 
-## Security & Configuration Tips
-- Avoid committing secrets; use environment variables or Unity ProjectSettings where appropriate.
-- Use GitHub CLI for repository data (issues/PRs/releases): e.g., `gh pr create`, `gh issue list`.
+- **Motion-Adaptive Sending**: Transform sending uses `SendRate` as an upper bound with `Only-on-change` filtering plus a `1Hz` heartbeat while idle.
+- **Bandwidth Planning**: Assume motion-dependent traffic with an idle heartbeat floor, not continuous full-payload flow.
 
+## Quick Start
+
+### Python Server
+
+```bash
+cd STYLY-NetSync-Server
+pip install -e ".[dev]"
+styly-netsync-server
+# Quality pipeline (run before committing)
+black src/ tests/ && ruff check src/ tests/ && mypy src/ && pytest --cov=src
+```
+
+### Unity Client
+
+- Open `STYLY-NetSync-Unity/` in Unity 6
+- Main package: `Packages/com.styly.styly-netsync/`
+- Test scenes: `Assets/Samples_Dev/Demo-01/` and `Assets/Samples_Dev/Debug/`
+
+## Architecture Overview
+
+- **Server**: Multi-threaded Python (receive, periodic, discovery threads) with ZeroMQ DEALER-ROUTER + PUB-SUB and group-based room management
+- **Unity Client**: Manager pattern with internal components (connection, transform sync, RPC, network variables, avatars)
+- **Protocol**: Binary v3 with quantized positions and smallest-three quaternion compression
+- **Technology**: Python 3.11+ / pyzmq / FastAPI / msgpack (server), Unity 6 / NetMQ / Newtonsoft.Json (client)
+
+## Protocol Rules
+
+- Transform protocol is `protocolVersion=3` only (`v2` removed)
+- Message IDs: `MSG_CLIENT_POSE=11`, `MSG_ROOM_POSE=12`
+- `Head` is absolute; `Right/Left/Virtual` are head-relative
+- Position quantization: absolute `int24 @ 0.01m`, head-relative `int16 @ 0.005m`; out-of-range values clamped
+- Quaternion: 32-bit smallest-three compression
+- Server relays raw client pose body bytes (opaque relay, no decode)
+- **Do NOT use `ZMQ_CONFLATE`**: It corrupts 2-frame multipart messages (topic + payload). Implement conflate-like behavior at the application level.
+- Priority-based sending: Control messages (RPC, Network Variables) prioritized over Transform updates
+
+### Backward Compatibility Policy
+
+- Network protocol changes do NOT require backward compatibility — deploy server and clients together
+- Avoid unnecessary breaking changes to non-networking code
+- Always notify the user of breaking changes
+
+## Unity–Python Feature Parity
+
+The Python client (`client.py`) and Unity client (`NetSyncManager.cs` + internal managers) must maintain feature parity. When modifying one side, check whether the other needs the same change.
+
+Key mappings: `NetSyncManager.cs` ↔ `client.py`, `ConnectionManager.cs` ↔ connection in `client.py`, `BinarySerializer.cs` ↔ `binary_serializer.py`, `RPCManager.cs`/`NetworkVariableManager.cs` ↔ RPC/NV in `client.py`
+
+## Coding Rules
+
+### Unity C# (CRITICAL)
+
+- **Never use null propagation (`?.` / `??`) with UnityEngine.Object types**
+- All Unity API calls must be on main thread — no background thread access
+- Do not add `.meta` files manually
+- Namespace: `Styly.NetSync` (public) / `Styly.NetSync.Internal` (internal)
+- Naming: private fields `_camelCase`, public `PascalCase`, 4-space indent
+
+### Python
+
+- Black (88 chars), Ruff, MyPy strict; `snake_case` functions, `PascalCase` classes
+
+## Commit & PR Guidelines
+
+- Conventional Commits (`feat:`, `fix:`, `refactor:`); subject ≤72 chars
+- Target PRs to `develop`; manual PRs to `main` are blocked (use release workflow)
+- PR checklist: description, linked issues, test evidence (logs/screenshots)
+
+## Task Completion Checklist
+
+- **Python**: `black src/ tests/ && ruff check src/ tests/ && mypy src/ && pytest`
+- **Unity**: Verify compilation, test in demo scenes, check console for errors
+- **Both**: Commit with descriptive messages; test server-client integration when applicable
+- Avoid committing secrets

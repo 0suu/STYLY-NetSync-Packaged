@@ -7,6 +7,7 @@ using System.Text;
 using NetMQ;
 using NetMQ.Sockets;
 using UnityEngine;
+using Styly.NetSync.Utils;
 
 namespace Styly.NetSync
 {
@@ -25,6 +26,13 @@ namespace Styly.NetSync
         // Thread-safe exception state (written on receive thread, read on main thread)
         private volatile Exception _lastException;
         private long _lastExceptionAtUnixMs;
+
+        // Thread-safe queues for cross-thread logging and callbacks
+        // Network thread enqueues; main thread drains via DrainMainThreadActions()
+        private readonly ConcurrentQueue<(LogLevel level, string message)> _pendingLogs = new();
+        private readonly ConcurrentQueue<Action> _pendingMainThreadActions = new();
+
+        private enum LogLevel { Info, Warning, Error }
 
         public SubscriberSocket SubSocket => _subSocket;
         public bool IsConnected => _dealerSocket != null && _subSocket != null && !_connectionError;
@@ -128,24 +136,16 @@ namespace Styly.NetSync
             _shouldStop = true;
             ClearOutgoingBuffers();
 
-            // Dispose sockets
-            if (_subSocket != null)
-            {
-                _subSocket.Dispose();
-            }
-            if (_dealerSocket != null)
-            {
-                _dealerSocket.Dispose();
-            }
-
-            _subSocket = null;
-            _dealerSocket = null;
-
-            // Wait for receive thread to exit (unless we're on the receive thread)
+            // Wait for receive thread to exit first — the using-var blocks inside
+            // NetworkLoop will dispose the sockets safely when the thread exits.
+            // Do NOT dispose sockets here; the network thread may still be using them.
             if (Thread.CurrentThread != _receiveThread)
             {
                 WaitThreadExit(_receiveThread, 1000);
             }
+
+            _subSocket = null;
+            _dealerSocket = null;
             _receiveThread = null;
 
             // OS-specific cleanup
@@ -216,6 +216,23 @@ namespace Styly.NetSync
             Volatile.Write(ref _latestTransform, packet);
         }
 
+        /// <summary>
+        /// Build a ZeroMQ connect address from a server address and port.
+        /// Note: NetMQ (pure C# ZeroMQ) does not support the libzmq extended TCP
+        /// format (tcp://source:0;dest:port) for source-NIC binding, so we use
+        /// the plain tcp://host:port format.
+        /// </summary>
+        private static string BuildConnectAddress(string serverAddress, int port)
+        {
+            string host = serverAddress;
+            if (host.StartsWith("tcp://"))
+            {
+                host = host.Substring(6);
+            }
+
+            return $"tcp://{host}:{port}";
+        }
+
         private void NetworkLoop(string serverAddress, int dealerPort, int subPort, string roomId)
         {
             try
@@ -224,30 +241,29 @@ namespace Styly.NetSync
                 using var dealer = new DealerSocket();
                 dealer.Options.Linger = TimeSpan.Zero;
                 dealer.Options.SendHighWatermark = 10;
-                dealer.Connect($"{serverAddress}:{dealerPort}");
+                var dealerAddr = BuildConnectAddress(serverAddress, dealerPort);
+                dealer.Connect(dealerAddr);
                 _dealerSocket = dealer;
 
-                DebugLog($"[Thread] DEALER connected → {serverAddress}:{dealerPort}");
+                if (_enableDebugLogs) _pendingLogs.Enqueue((LogLevel.Info, $"[ConnectionManager] [Thread] DEALER connected → {dealerAddr}"));
 
                 // Subscriber (for receiving)
                 using var sub = new SubscriberSocket();
                 sub.Options.Linger = TimeSpan.Zero;
                 sub.Options.ReceiveHighWatermark = TransformRcvHwm;
-                sub.Connect($"{serverAddress}:{subPort}");
+                var subAddr = BuildConnectAddress(serverAddress, subPort);
+                sub.Connect(subAddr);
                 // Subscribe with topic. Using string here is one-time and acceptable.
                 // Note: NetMQ also offers byte[] overloads, but subscription happens once per connection.
                 sub.Subscribe(roomId);
                 _subSocket = sub;
 
-                DebugLog($"[Thread] SUB connected    → {serverAddress}:{subPort}");
+                if (_enableDebugLogs) _pendingLogs.Enqueue((LogLevel.Info, $"[ConnectionManager] [Thread] SUB connected    → {subAddr}"));
 
                 var roomIdBytes = Encoding.UTF8.GetBytes(roomId);
 
-                // Notify connection established
-                if (OnConnectionEstablished != null)
-                {
-                    OnConnectionEstablished.Invoke();
-                }
+                // Queue connection callback for main thread instead of invoking directly
+                _pendingMainThreadActions.Enqueue(() => OnConnectionEstablished?.Invoke());
 
                 while (!_shouldStop)
                 {
@@ -284,7 +300,7 @@ namespace Styly.NetSync
                         }
                         catch (Exception ex)
                         {
-                            Debug.LogError($"Transform parse error: {ex.Message}");
+                            _pendingLogs.Enqueue((LogLevel.Error, $"Transform parse error: {ex.Message}"));
                         }
                         receivedAny = true;
                     }
@@ -309,7 +325,7 @@ namespace Styly.NetSync
                             }
                             catch (Exception ex)
                             {
-                                Debug.LogError($"Control message parse error: {ex.Message}");
+                                _pendingLogs.Enqueue((LogLevel.Error, $"Control message parse error: {ex.Message}"));
                             }
                         }
                         receivedAny = true;
@@ -333,24 +349,24 @@ namespace Styly.NetSync
                     Volatile.Write(ref _lastExceptionAtUnixMs, timestamp);
                     _lastException = ex_local;
                     
-                    // Log detailed exception context
+                    // Queue log for main thread (Debug.Log* is not safe from background threads)
                     var threadId = Thread.CurrentThread.ManagedThreadId;
                     var endpoint = $"{serverAddress}:{dealerPort}/{subPort}";
-                    Debug.LogError($"[ConnectionManager] Network thread error. " +
-                                   $"Type={ex_local.GetType().Name} Message={ex_local.Message} " +
-                                   $"Endpoint={endpoint} ThreadId={threadId} " +
-                                   $"Time={timestamp}");
-                    
+                    _pendingLogs.Enqueue((LogLevel.Error,
+                        $"[ConnectionManager] Network thread error. " +
+                        $"Type={ex_local.GetType().Name} Message={ex_local.Message} " +
+                        $"Endpoint={endpoint} ThreadId={threadId} " +
+                        $"Time={timestamp}"));
+
 #if NETSYNC_DEBUG_CONNECTION
-                    // Verbose logging: include stack trace
-                    Debug.LogError($"[ConnectionManager] Stack trace: {ex_local.StackTrace}");
+                    _pendingLogs.Enqueue((LogLevel.Error,
+                        $"[ConnectionManager] Stack trace: {ex_local.StackTrace}"));
 #endif
-                    
+
                     _connectionError = true;
-                    if (OnConnectionError != null)
-                    {
-                        OnConnectionError.Invoke(ex_local.Message);
-                    }
+                    // Queue callback for main thread instead of invoking directly
+                    var errorMessage = ex_local.Message;
+                    _pendingMainThreadActions.Enqueue(() => OnConnectionError?.Invoke(errorMessage));
                 }
             }
         }
@@ -389,7 +405,7 @@ namespace Styly.NetSync
                 // TTL check - skip expired packets
                 if (now - packet.EnqueuedAt > CTRL_TTL_SECONDS)
                 {
-                    Debug.LogWarning($"[ConnectionManager] Control packet expired (TTL {CTRL_TTL_SECONDS}s exceeded)");
+                    _pendingLogs.Enqueue((LogLevel.Warning, $"[ConnectionManager] Control packet expired (TTL {CTRL_TTL_SECONDS}s exceeded)"));
                     continue;
                 }
 
@@ -567,6 +583,35 @@ namespace Styly.NetSync
             // (NetSyncManager has already copied it to _pendingConnectionException)
             _lastException = null;
             // Keep timestamp for basic diagnostics
+        }
+
+        /// <summary>
+        /// Drain pending logs and callbacks queued by the network thread.
+        /// Must be called from the main Unity thread (e.g., in Update).
+        /// </summary>
+        public void DrainMainThreadActions()
+        {
+            while (_pendingLogs.TryDequeue(out var entry))
+            {
+                switch (entry.level)
+                {
+                    case LogLevel.Error: Debug.LogError(entry.message); break;
+                    case LogLevel.Warning: Debug.LogWarning(entry.message); break;
+                    default: Debug.Log(entry.message); break;
+                }
+            }
+
+            while (_pendingMainThreadActions.TryDequeue(out var action))
+            {
+                try
+                {
+                    action();
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogException(ex);
+                }
+            }
         }
     }
 }
