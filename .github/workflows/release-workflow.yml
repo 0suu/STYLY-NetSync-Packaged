@@ -404,10 +404,16 @@ jobs:
             "$KEYCHAIN_PATH"
 
       - name: Build macOS executable
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
-          python scripts/build_single_executable.py --name "${APP_BASE}-macos-arm64"
+          set -euo pipefail
+          [[ -n "$MACOS_SIGNING_IDENTITY" ]] || { echo "Missing secrets.MACOS_SIGNING_IDENTITY"; exit 1; }
+          python scripts/build_single_executable.py \
+            --name "${APP_BASE}-macos-arm64" \
+            --codesign-identity "$MACOS_SIGNING_IDENTITY"
 
-      - name: Sign macOS executable
+      - name: Verify macOS executable signature
         env:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
@@ -416,14 +422,58 @@ jobs:
           [[ -n "$MACOS_SIGNING_IDENTITY" ]] || { echo "Missing secrets.MACOS_SIGNING_IDENTITY"; exit 1; }
 
           chmod +x "dist/${APP_BASE}-macos-arm64"
-          codesign --force --timestamp --options runtime \
-            --sign "$MACOS_SIGNING_IDENTITY" \
-            "dist/${APP_BASE}-macos-arm64"
           codesign --verify --strict --verbose=2 "dist/${APP_BASE}-macos-arm64"
+          codesign --display --verbose=4 "dist/${APP_BASE}-macos-arm64"
 
-      - name: Package macOS binary as tar.gz
+      - name: Create macOS DMG payload
         run: |
-          tar -czf "dist/${APP_BASE}-macos-arm64.tar.gz" -C dist "${APP_BASE}-macos-arm64"
+          set -euo pipefail
+          PAYLOAD_DIR="dist/dmg-payload"
+          rm -rf "$PAYLOAD_DIR"
+          mkdir -p "$PAYLOAD_DIR"
+          cp "dist/${APP_BASE}-macos-arm64" "$PAYLOAD_DIR/${APP_BASE}-macos-arm64"
+
+      - name: Create macOS DMG
+        run: |
+          set -euo pipefail
+          hdiutil create \
+            -volname "${APP_BASE}-macos-arm64" \
+            -srcfolder "dist/dmg-payload" \
+            -ov \
+            -format UDZO \
+            "dist/${APP_BASE}-macos-arm64.dmg"
+
+      - name: Sign macOS DMG
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          [[ -n "$MACOS_SIGNING_IDENTITY" ]] || { echo "Missing secrets.MACOS_SIGNING_IDENTITY"; exit 1; }
+          codesign --force --timestamp --sign "$MACOS_SIGNING_IDENTITY" \
+            "dist/${APP_BASE}-macos-arm64.dmg"
+          codesign --verify --verbose=2 "dist/${APP_BASE}-macos-arm64.dmg"
+
+      - name: Notarize macOS DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          [[ -n "$APPLE_ID" ]] || { echo "Missing secrets.APPLE_ID"; exit 1; }
+          [[ -n "$APPLE_APP_SPECIFIC_PASSWORD" ]] || { echo "Missing secrets.APPLE_APP_SPECIFIC_PASSWORD"; exit 1; }
+          [[ -n "$APPLE_TEAM_ID" ]] || { echo "Missing secrets.APPLE_TEAM_ID"; exit 1; }
+
+          xcrun notarytool submit "dist/${APP_BASE}-macos-arm64.dmg" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+      - name: Staple macOS DMG
+        run: |
+          set -euo pipefail
+          xcrun stapler staple "dist/${APP_BASE}-macos-arm64.dmg"
 
       - name: Clean up signing keychain
         if: always()
@@ -438,7 +488,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: releasebin-macos
-          path: STYLY-NetSync-Server/dist/${{ env.APP_BASE }}-macos-arm64.tar.gz
+          path: STYLY-NetSync-Server/dist/${{ env.APP_BASE }}-macos-arm64.dmg
 
   promote-main:
     needs: [set-version-and-release, build-windows, build-macos]
