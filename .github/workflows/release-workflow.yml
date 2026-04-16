@@ -13,9 +13,18 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: write
+
 jobs:
   set-version-and-release:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release-meta.outputs.version }}
+      tag_name: ${{ steps.release-meta.outputs.tag_name }}
+      release_name: ${{ steps.release-meta.outputs.release_name }}
+      app_base_name: ${{ steps.release-meta.outputs.app_base_name }}
+      release_commit_sha: ${{ steps.capture-release-commit.outputs.release_commit_sha }}
 
     steps:
       - name: Checkout repository
@@ -26,6 +35,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Validate version format
+        id: release-meta
         run: |
           VERSION="${{ github.event.inputs.version }}"
           # Strip leading 'v' or 'V' prefix if present
@@ -39,6 +49,10 @@ jobs:
           echo "✅ Version format is valid: $VERSION"
           # Export normalized version for subsequent steps
           echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag_name=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_name=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "app_base_name=styly-netsync-server-v$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Configure Git
         run: |
@@ -234,27 +248,12 @@ jobs:
           git push origin main
           echo "✅ Pushed changes to main branch"
 
-      - name: Create Release Draft
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Capture release commit metadata
+        id: capture-release-commit
         run: |
-          TAG_NAME="v$VERSION"
-
-          echo "Creating release draft for $TAG_NAME..."
-
-          # Create release draft using GitHub CLI
-          gh release create "$TAG_NAME" \
-            --draft \
-            --target main \
-            --title "$TAG_NAME" \
-            --notes "## What's Changed
-
-
-          ---
-          **Full Changelog**: https://github.com/${{ github.repository }}/compare/previous-tag...$TAG_NAME"
-
-          echo "✅ Release draft created: $TAG_NAME"
-          echo "📝 Please edit the release notes at: https://github.com/${{ github.repository }}/releases"
+          RELEASE_COMMIT_SHA="$(git rev-parse HEAD)"
+          echo "release_commit_sha=$RELEASE_COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "✅ Release target commit: $RELEASE_COMMIT_SHA"
 
       - name: Summary
         if: always()
@@ -284,7 +283,7 @@ jobs:
               echo "| Version Update | ✅ | Updated Python pyproject.toml to \`$VERSION\` |"
               echo "| Git Commit | ✅ | Committed changes to develop branch |"
               echo "| Branch Merge | ✅ | Fast-forward merged develop → main |"
-              echo "| Release Draft | ✅ | Created draft release with tag \`$TAG_NAME\` |"
+              echo "| Release Prep | ✅ | Prepared release metadata for tag \`$TAG_NAME\` |"
               echo ""
               echo "### 📦 Updated Files"
               echo ""
@@ -299,8 +298,7 @@ jobs:
               echo ""
               echo "### 🚀 Next Steps"
               echo ""
-              echo "**Review Release Draft**"
-              echo "   - [Edit Release Draft](https://github.com/${{ github.repository }}/releases)"
+              echo "Downstream jobs will build Windows/macOS binaries and publish them to the draft release."
             else
               echo "## ❌ Status: Failed"
               echo ""
@@ -330,3 +328,163 @@ jobs:
             echo "---"
             echo "*Generated at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')*"
           } >> $GITHUB_STEP_SUMMARY
+
+  build-windows:
+    needs: set-version-and-release
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: STYLY-NetSync-Server
+    env:
+      RELEASE_COMMIT_SHA: ${{ needs.set-version-and-release.outputs.release_commit_sha }}
+      APP_BASE: ${{ needs.set-version-and-release.outputs.app_base_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_COMMIT_SHA }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Build Windows executable
+        run: |
+          python scripts/build_single_executable.py --name "${APP_BASE}-windows"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: releasebin-windows
+          path: STYLY-NetSync-Server/dist/${{ env.APP_BASE }}-windows.exe
+
+  build-macos:
+    needs: set-version-and-release
+    runs-on: macos-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: STYLY-NetSync-Server
+    env:
+      RELEASE_COMMIT_SHA: ${{ needs.set-version-and-release.outputs.release_commit_sha }}
+      APP_BASE: ${{ needs.set-version-and-release.outputs.app_base_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_COMMIT_SHA }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Import macOS signing certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "$MACOS_CERTIFICATE_P12" ]] || { echo "Missing secrets.MACOS_CERTIFICATE_P12"; exit 1; }
+          [[ -n "$MACOS_CERTIFICATE_PASSWORD" ]] || { echo "Missing secrets.MACOS_CERTIFICATE_PASSWORD"; exit 1; }
+          [[ -n "$MACOS_KEYCHAIN_PASSWORD" ]] || { echo "Missing secrets.MACOS_KEYCHAIN_PASSWORD"; exit 1; }
+
+          CERT_PATH="$RUNNER_TEMP/macos-signing-cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$MACOS_KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+      - name: Build macOS executable
+        run: |
+          python scripts/build_single_executable.py --name "${APP_BASE}-macos"
+
+      - name: Sign macOS executable
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "$MACOS_SIGNING_IDENTITY" ]] || { echo "Missing secrets.MACOS_SIGNING_IDENTITY"; exit 1; }
+
+          chmod +x "dist/${APP_BASE}-macos"
+          codesign --force --timestamp --options runtime \
+            --sign "$MACOS_SIGNING_IDENTITY" \
+            "dist/${APP_BASE}-macos"
+          codesign --verify --strict --verbose=2 "dist/${APP_BASE}-macos"
+
+      - name: Package macOS binary as tar.gz
+        run: |
+          tar -czf "dist/${APP_BASE}-macos.tar.gz" -C dist "${APP_BASE}-macos"
+
+      - name: Clean up signing keychain
+        if: always()
+        env:
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          if [ -f "$KEYCHAIN_PATH" ] && [ -n "$MACOS_KEYCHAIN_PASSWORD" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: releasebin-macos
+          path: STYLY-NetSync-Server/dist/${{ env.APP_BASE }}-macos.tar.gz
+
+  publish-release:
+    needs: [set-version-and-release, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: releasebin-windows
+          path: release-assets/releasebin-windows
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: releasebin-macos
+          path: release-assets/releasebin-macos
+
+      - name: Create or update draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.set-version-and-release.outputs.tag_name }}
+          target_commitish: ${{ needs.set-version-and-release.outputs.release_commit_sha }}
+          name: ${{ needs.set-version-and-release.outputs.release_name }}
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+          overwrite_files: true
+          files: |
+            release-assets/releasebin-windows/*
+            release-assets/releasebin-macos/*
