@@ -33,6 +33,14 @@ def parse_args() -> argparse.Namespace:
             "(default: onefile)."
         ),
     )
+    parser.add_argument(
+        "--codesign-identity",
+        default=None,
+        help=(
+            "macOS code-signing identity passed to PyInstaller so collected "
+            "binaries are signed during the build."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -52,7 +60,12 @@ def ensure_pyinstaller_installed() -> None:
         raise SystemExit(1) from None
 
 
-def build_command(project_root: Path, app_name: str, build_format: str) -> list[str]:
+def build_command(
+    project_root: Path,
+    app_name: str,
+    build_format: str,
+    codesign_identity: str | None,
+) -> list[str]:
     entrypoint = project_root / "pyinstaller" / "entrypoint.py"
     if not entrypoint.exists():
         print(f"Entrypoint not found: {entrypoint}", file=sys.stderr)
@@ -91,6 +104,9 @@ def build_command(project_root: Path, app_name: str, build_format: str) -> list[
         "zmq.backend",
     ]
 
+    if codesign_identity:
+        command.extend(["--codesign-identity", codesign_identity])
+
     if build_format == "macos-app":
         command.extend(["--windowed"])
     else:
@@ -109,7 +125,9 @@ def main() -> None:
         shutil.rmtree(project_root / "build", ignore_errors=True)
         shutil.rmtree(project_root / "dist", ignore_errors=True)
 
-    cmd = build_command(project_root, args.name, args.format)
+    cmd = build_command(
+        project_root, args.name, args.format, args.codesign_identity
+    )
     subprocess.run(cmd, check=True, cwd=project_root)
 
     if args.format == "macos-app":
