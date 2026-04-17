@@ -411,9 +411,11 @@ jobs:
           [[ -n "$MACOS_SIGNING_IDENTITY" ]] || { echo "Missing secrets.MACOS_SIGNING_IDENTITY"; exit 1; }
           python scripts/build_single_executable.py \
             --name "${APP_BASE}-macos-arm64" \
+            --format macos-app-onefile \
+            --bundle-identifier "com.styly.netsync.server" \
             --codesign-identity "$MACOS_SIGNING_IDENTITY"
 
-      - name: Verify macOS executable signature
+      - name: Sign macOS app bundle
         env:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
@@ -421,39 +423,25 @@ jobs:
 
           [[ -n "$MACOS_SIGNING_IDENTITY" ]] || { echo "Missing secrets.MACOS_SIGNING_IDENTITY"; exit 1; }
 
-          chmod +x "dist/${APP_BASE}-macos-arm64"
-          codesign --verify --strict --verbose=2 "dist/${APP_BASE}-macos-arm64"
-          codesign --display --verbose=4 "dist/${APP_BASE}-macos-arm64"
+          codesign --force --deep --options runtime --timestamp \
+            --sign "$MACOS_SIGNING_IDENTITY" \
+            "dist/${APP_BASE}-macos-arm64.app"
 
-      - name: Create macOS DMG payload
+      - name: Verify macOS app bundle signature
         run: |
           set -euo pipefail
-          PAYLOAD_DIR="dist/dmg-payload"
-          rm -rf "$PAYLOAD_DIR"
-          mkdir -p "$PAYLOAD_DIR"
-          cp "dist/${APP_BASE}-macos-arm64" "$PAYLOAD_DIR/${APP_BASE}-macos-arm64"
+          codesign --verify --deep --strict --verbose=2 \
+            "dist/${APP_BASE}-macos-arm64.app"
+          codesign --display --verbose=4 "dist/${APP_BASE}-macos-arm64.app"
 
-      - name: Create macOS DMG
+      - name: Create macOS notarization ZIP
         run: |
           set -euo pipefail
-          hdiutil create \
-            -volname "${APP_BASE}-macos-arm64" \
-            -srcfolder "dist/dmg-payload" \
-            -ov \
-            -format UDZO \
-            "dist/${APP_BASE}-macos-arm64.dmg"
+          ditto -c -k --keepParent \
+            "dist/${APP_BASE}-macos-arm64.app" \
+            "dist/${APP_BASE}-macos-arm64-notarization.zip"
 
-      - name: Sign macOS DMG
-        env:
-          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-        run: |
-          set -euo pipefail
-          [[ -n "$MACOS_SIGNING_IDENTITY" ]] || { echo "Missing secrets.MACOS_SIGNING_IDENTITY"; exit 1; }
-          codesign --force --timestamp --sign "$MACOS_SIGNING_IDENTITY" \
-            "dist/${APP_BASE}-macos-arm64.dmg"
-          codesign --verify --verbose=2 "dist/${APP_BASE}-macos-arm64.dmg"
-
-      - name: Notarize macOS DMG
+      - name: Notarize macOS app ZIP
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
@@ -464,16 +452,25 @@ jobs:
           [[ -n "$APPLE_APP_SPECIFIC_PASSWORD" ]] || { echo "Missing secrets.APPLE_APP_SPECIFIC_PASSWORD"; exit 1; }
           [[ -n "$APPLE_TEAM_ID" ]] || { echo "Missing secrets.APPLE_TEAM_ID"; exit 1; }
 
-          xcrun notarytool submit "dist/${APP_BASE}-macos-arm64.dmg" \
+          xcrun notarytool submit "dist/${APP_BASE}-macos-arm64-notarization.zip" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
 
-      - name: Staple macOS DMG
+      - name: Staple macOS app bundle
         run: |
           set -euo pipefail
-          xcrun stapler staple "dist/${APP_BASE}-macos-arm64.dmg"
+          xcrun stapler staple "dist/${APP_BASE}-macos-arm64.app"
+          xcrun stapler validate "dist/${APP_BASE}-macos-arm64.app"
+
+      - name: Create macOS release ZIP
+        run: |
+          set -euo pipefail
+          rm -f "dist/${APP_BASE}-macos-arm64.zip"
+          ditto -c -k --keepParent \
+            "dist/${APP_BASE}-macos-arm64.app" \
+            "dist/${APP_BASE}-macos-arm64.zip"
 
       - name: Clean up signing keychain
         if: always()
@@ -488,7 +485,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: releasebin-macos
-          path: STYLY-NetSync-Server/dist/${{ env.APP_BASE }}-macos-arm64.dmg
+          path: STYLY-NetSync-Server/dist/${{ env.APP_BASE }}-macos-arm64.zip
 
   promote-main:
     needs: [set-version-and-release, build-windows, build-macos]

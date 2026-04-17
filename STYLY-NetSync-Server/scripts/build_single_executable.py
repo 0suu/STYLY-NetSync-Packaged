@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -26,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--format",
-        choices=("onefile", "macos-app"),
+        choices=("onefile", "macos-app", "macos-app-onefile"),
         default="onefile",
         help=(
             "Build output format: onefile executable or macOS .app bundle "
@@ -39,6 +40,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "macOS code-signing identity passed to PyInstaller so collected "
             "binaries are signed during the build."
+        ),
+    )
+    parser.add_argument(
+        "--bundle-identifier",
+        default="com.styly.netsync.server",
+        help=(
+            "Bundle identifier used when building a macOS .app bundle "
+            "(default: com.styly.netsync.server)."
         ),
     )
     return parser.parse_args()
@@ -109,11 +118,52 @@ def build_command(
 
     if build_format == "macos-app":
         command.extend(["--windowed"])
+    elif build_format == "macos-app-onefile":
+        command.extend(["--onefile", "--console"])
     else:
         command.extend(["--onefile", "--console"])
 
     command.append(str(entrypoint))
     return command
+
+
+def create_macos_app_bundle(
+    dist_dir: Path,
+    app_name: str,
+    bundle_identifier: str,
+) -> Path:
+    binary_path = dist_dir / app_name
+    if not binary_path.exists():
+        print(f"Executable not found: {binary_path}", file=sys.stderr)
+        raise SystemExit(1)
+
+    app_path = dist_dir / f"{app_name}.app"
+    contents_dir = app_path / "Contents"
+    macos_dir = contents_dir / "MacOS"
+
+    shutil.rmtree(app_path, ignore_errors=True)
+    macos_dir.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(binary_path), str(macos_dir / app_name))
+
+    plist_path = contents_dir / "Info.plist"
+    with plist_path.open("wb") as plist_file:
+        plistlib.dump(
+            {
+                "CFBundleDevelopmentRegion": "en",
+                "CFBundleExecutable": app_name,
+                "CFBundleIdentifier": bundle_identifier,
+                "CFBundleInfoDictionaryVersion": "6.0",
+                "CFBundleName": app_name,
+                "CFBundlePackageType": "APPL",
+                "CFBundleShortVersionString": "1.0",
+                "CFBundleVersion": "1",
+                "LSMinimumSystemVersion": "11.0",
+            },
+            plist_file,
+            sort_keys=True,
+        )
+
+    return app_path
 
 
 def main() -> None:
@@ -132,6 +182,10 @@ def main() -> None:
 
     if args.format == "macos-app":
         output_path = project_root / "dist" / f"{args.name}.app"
+    elif args.format == "macos-app-onefile":
+        output_path = create_macos_app_bundle(
+            project_root / "dist", args.name, args.bundle_identifier
+        )
     else:
         extension = ".exe" if sys.platform.startswith("win") else ""
         output_path = project_root / "dist" / f"{args.name}{extension}"
