@@ -140,10 +140,43 @@ def create_macos_app_bundle(
     app_path = dist_dir / f"{app_name}.app"
     contents_dir = app_path / "Contents"
     macos_dir = contents_dir / "MacOS"
+    resources_dir = contents_dir / "Resources"
+    bin_dir = resources_dir / "bin"
 
     shutil.rmtree(app_path, ignore_errors=True)
     macos_dir.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(binary_path), str(macos_dir / app_name))
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(binary_path), str(bin_dir / app_name))
+
+    launcher_path = macos_dir / app_name
+    launcher_path.write_text(
+        "\n".join(
+            [
+                "#!/bin/bash",
+                "set -euo pipefail",
+                'APP_CONTENTS_DIR="$(cd "$(dirname "$0")/.." && pwd)"',
+                'open -a Terminal "$APP_CONTENTS_DIR/Resources/run.command"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    launcher_path.chmod(0o755)
+
+    run_command_path = resources_dir / "run.command"
+    run_command_path.write_text(
+        "\n".join(
+            [
+                "#!/bin/bash",
+                "set -euo pipefail",
+                'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"',
+                f'exec "$SCRIPT_DIR/bin/{app_name}" "$@"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    run_command_path.chmod(0o755)
 
     plist_path = contents_dir / "Info.plist"
     with plist_path.open("wb") as plist_file:
@@ -158,6 +191,7 @@ def create_macos_app_bundle(
                 "CFBundleShortVersionString": "1.0",
                 "CFBundleVersion": "1",
                 "LSMinimumSystemVersion": "11.0",
+                "LSUIElement": True,
             },
             plist_file,
             sort_keys=True,
