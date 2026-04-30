@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">NetSync Android Server</string>
+    <string name="start">Start</string>
+    <string name="stop">Stop</string>
+    <string name="refresh_log">Refresh Log</string>
+    <string name="notification_channel_name">NetSync Server</string>
+    <string name="notification_channel_description">Foreground service for STYLY NetSync server</string>
+    <string name="notification_title">Server running</string>
+</resources>
