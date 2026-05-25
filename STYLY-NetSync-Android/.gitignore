@@ -1,0 +1,20 @@
+# Android Studio / Gradle local files
+.gradle/
+.idea/
+*.iml
+local.properties
+.kotlin/
+
+# Build outputs
+build/
+app/build/
+
+# APK/AAB artifacts
+*.apk
+*.aab
+*.ap_
+
+# Misc local artifacts
+captures/
+outputs/
+

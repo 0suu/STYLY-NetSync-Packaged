@@ -1,0 +1,18 @@
+{
+  "name": "com.styly.styly-netsync.meta-colocation",
+  "version": "0.7.1",
+  "displayName": "STYLY NetSync Meta Colocation",
+  "unity": "6000.0",
+  "description": "Meta OpenXR shared anchors based colocation helper for STYLY NetSync.",
+  "dependencies": {
+    "com.styly.styly-netsync": "0.7.1",
+    "com.unity.xr.arfoundation": "6.3.0",
+    "com.unity.xr.meta-openxr": "2.3.0"
+  },
+  "author": {
+    "name": "STYLY, Inc.",
+    "email": "info@styly.inc",
+    "url": "https://styly.inc/"
+  }
+}
+

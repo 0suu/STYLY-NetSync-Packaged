@@ -1,0 +1,19 @@
+{
+  "name": "Styly.NetSync.MetaColocation.Editor",
+  "rootNamespace": "Styly.NetSync.MetaColocation.Editor",
+  "references": [
+    "Styly.NetSync.MetaColocation"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}
+

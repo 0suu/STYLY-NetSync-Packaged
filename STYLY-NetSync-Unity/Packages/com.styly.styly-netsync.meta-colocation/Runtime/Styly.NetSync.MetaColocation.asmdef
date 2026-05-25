@@ -1,0 +1,24 @@
+{
+  "name": "Styly.NetSync.MetaColocation",
+  "rootNamespace": "Styly.NetSync.MetaColocation",
+  "references": [
+    "com.styly.styly-netsync",
+    "Unity.XR.CoreUtils",
+    "Unity.XR.ARFoundation",
+    "Unity.XR.ARSubsystems",
+    "Unity.XR.MetaOpenXR"
+  ],
+  "includePlatforms": [
+    "Android",
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}
+
